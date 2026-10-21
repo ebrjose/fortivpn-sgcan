@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -u
+
+OTP_PIPE="${OTP_PIPE:-/run/fortivpn/otp.pipe}"
+OTP_REQUEST="${OTP_REQUEST:-/run/fortivpn/otp.request}"
+OTP_TIMEOUT="${OTP_TIMEOUT:-120}"
+
+log() { printf 'fortivpn-otp-helper: %s\n' "$1" >&2; }
+
+if [[ ! -p "$OTP_PIPE" ]]; then
+    log "OTP FIFO is unavailable"
+    exit 1
+fi
+
+nonce="$(date +%s)-$$"
+if ! printf 'REQUEST %s\n' "$nonce" >"$OTP_REQUEST"; then
+    log "cannot post OTP request"
+    exit 1
+fi
+log "OTP requested; waiting up to ${OTP_TIMEOUT}s"
+
+code=""
+deadline=$((SECONDS + OTP_TIMEOUT))
+while (( SECONDS < deadline )); do
+    remaining=$((deadline - SECONDS))
+    line="$(timeout "$remaining" head -n1 "$OTP_PIPE" 2>/dev/null)"
+    [[ -n "$line" ]] || break
+    got_nonce="${line%% *}"
+    got_code="$(printf '%s' "${line#* }" | tr -cd '0-9')"
+    if [[ "$got_nonce" == "$nonce" && "$got_code" =~ ^[0-9]{4,8}$ ]]; then
+        code="$got_code"
+        break
+    fi
+    log "discarded an invalid or stale OTP response"
+done
+
+printf 'IDLE\n' >"$OTP_REQUEST" 2>/dev/null || true
+if [[ -z "$code" ]]; then
+    log "OTP was not supplied before timeout"
+    exit 1
+fi
+
+log "OTP delivered"
+printf '%s\n' "$code"

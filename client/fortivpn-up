@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( EUID != 0 )); then
+    echo "Usage: pkexec fortivpn-up PROFILE_ID" >&2
+    exit 1
+fi
+
+slug=${1:-}
+[[ "$slug" =~ ^[a-z0-9][a-z0-9_-]{0,47}$ ]] || {
+    echo "Select a valid profile." >&2
+    exit 1
+}
+
+active_file=/run/fortivpn/active-profile
+if [[ -r "$active_file" ]]; then
+    previous=$(<"$active_file")
+    if [[ "$previous" =~ ^[a-z0-9][a-z0-9_-]{0,47}$ && "$previous" != "$slug" ]]; then
+        swanctl --terminate --ike "fortigate-$previous" --timeout 15000 >/dev/null 2>&1 || true
+    fi
+fi
+
+profile_name=$(/usr/local/sbin/fortivpn-profile render "$slug")
+systemctl restart strongswan
+swanctl --load-all >/dev/null
+echo "Starting $profile_name; a window will appear when the server requests the OTP..."
+if swanctl --initiate --child "fortigate-$slug-lan" --timeout 150000; then
+    printf '%s\n' "$slug" >/run/fortivpn/active-profile
+    chmod 600 /run/fortivpn/active-profile
+else
+    rm -f /run/fortivpn/active-profile
+    exit 1
+fi

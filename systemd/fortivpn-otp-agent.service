@@ -1,0 +1,19 @@
+[Unit]
+Description=FortiGate VPN OTP prompt agent
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/fortivpn-otp-agent.py
+Restart=on-failure
+RestartSec=2s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/run/fortivpn
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

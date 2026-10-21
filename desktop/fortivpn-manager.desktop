@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FortiGate VPN
+Comment=Manage FortiGate VPN profiles and connections
+Exec=/usr/local/bin/fortivpn-manager
+Icon=network-vpn
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=VPN;FortiGate;IPsec;

@@ -1,0 +1,169 @@
+#!/usr/bin/env bash
+set -u
+
+title='FortiGate VPN'
+index_file=/var/lib/fortivpn/profiles.index
+
+message_error() {
+    zenity --error --title="$title" --text="$1" --width=560
+}
+
+message_info() {
+    zenity --info --title="$title" --text="$1" --width=500
+}
+
+select_profile() {
+    local prompt=${1:-'Select a profile:'}
+    local rows=() slug name local_id gateway ranges
+    if [[ -r "$index_file" ]]; then
+        while IFS=$'\t' read -r slug name local_id gateway ranges; do
+            [[ -n "$slug" ]] || continue
+            rows+=("$slug" "$name" "$local_id" "$gateway" "$ranges")
+        done <"$index_file"
+    fi
+    if (( ${#rows[@]} == 0 )); then
+        message_error 'No profiles exist yet. Create one with "New profile".'
+        return 1
+    fi
+    zenity --list --title="$title" --text="$prompt" --width=820 --height=420 \
+        --hide-column=1 --print-column=1 \
+        --column='ID' --column='Connection' --column='Local ID' --column='FortiGate' --column='VPN networks' \
+        "${rows[@]}"
+}
+
+prompt_profile() {
+    local slug=$1 name=${2:-} gateway=${3:-} local_id=${4:-}
+    local vpn_user=${5:-} ranges=${6:-} psk password result status
+    local psk_title="$title — PSK" password_title="$title — password"
+    if [[ "$slug" != new ]]; then
+        psk_title="$psk_title (empty = keep current value)"
+        password_title="$password_title (empty = keep current value)"
+    fi
+
+    name=$(zenity --entry --title="$title — connection name" \
+        --text='Free-form name used to save and identify this connection:' --entry-text="$name" --width=480) || return
+    [[ -n "$name" ]] || return
+    gateway=$(zenity --entry --title="$title — server" \
+        --text='FortiGate IP address or hostname:' --entry-text="$gateway" --width=430) || return
+    local_id=$(zenity --entry --title="$title — Local ID" \
+        --text='Technical Local ID assigned by FortiGate (independent from the name):' \
+        --entry-text="$local_id" --width=520) || return
+    vpn_user=$(zenity --entry --title="$title — username" \
+        --text='VPN username:' --entry-text="$vpn_user" --width=430) || return
+    ranges=$(zenity --entry --title="$title — networks" \
+        --text='Comma-separated networks routed through this VPN.\nExample: 198.51.100.0/24,203.0.113.0/24' \
+        --entry-text="$ranges" --width=560) || return
+    psk=$(zenity --password --title="$psk_title") || return
+    password=$(zenity --password --title="$password_title") || return
+
+    result=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$name" "$gateway" "$local_id" "$vpn_user" "$ranges" "$psk" "$password" |
+        pkexec /usr/local/sbin/fortivpn-profile save "$slug" --stdin 2>&1)
+    status=$?
+    unset psk password
+    if (( status == 0 )); then
+        message_info "Profile '$name' saved."
+    else
+        message_error "Could not save the profile:\n$result"
+    fi
+}
+
+new_profile() {
+    prompt_profile new
+}
+
+edit_profile() {
+    local slug data status
+    slug=$(select_profile 'Select the profile to edit:') || return
+    data=$(pkexec /usr/local/sbin/fortivpn-profile show "$slug" 2>&1)
+    status=$?
+    if (( status != 0 )); then
+        message_error "Could not read the profile:\n$data"
+        return
+    fi
+    mapfile -t fields <<<"$data"
+    prompt_profile "$slug" "${fields[0]:-}" "${fields[1]:-}" \
+        "${fields[2]:-}" "${fields[3]:-}" "${fields[4]:-}"
+}
+
+delete_profile() {
+    local slug name result status
+    slug=$(select_profile 'Select the profile to delete:') || return
+    name=$(awk -F '\t' -v id="$slug" '$1 == id {print $2; exit}' "$index_file")
+    zenity --question --title="$title" \
+        --text="Delete profile '${name:-$slug}'?\n\nThis also deletes its saved credentials." \
+        --ok-label='Delete' --cancel-label='Cancel' --width=480 || return
+    result=$(pkexec /usr/local/sbin/fortivpn-profile delete "$slug" 2>&1)
+    status=$?
+    if (( status == 0 )); then
+        message_info 'Profile deleted.'
+    else
+        message_error "Could not delete the profile:\n$result"
+    fi
+}
+
+connect_profile() {
+    local slug name result status
+    slug=$(select_profile 'Select the account to connect:') || return
+    name=$(awk -F '\t' -v id="$slug" '$1 == id {print $2; exit}' "$index_file")
+    systemctl --user start fortivpn-otp-agent.service >/dev/null 2>&1 || true
+    result=$(pkexec /usr/local/sbin/fortivpn-up "$slug" 2>&1)
+    status=$?
+    if (( status == 0 )); then
+        message_info "'${name:-$slug}' is connected.\n\nOnly the networks defined in the profile go through the VPN."
+    else
+        message_error "Could not connect '${name:-$slug}':\n$result"
+    fi
+}
+
+disconnect_profile() {
+    local result status
+    result=$(pkexec /usr/local/sbin/fortivpn-down 2>&1)
+    status=$?
+    if (( status == 0 )); then
+        message_info "$result"
+    else
+        message_error "Could not disconnect:\n$result"
+    fi
+}
+
+show_status() {
+    local output status tmp
+    output=$(pkexec /usr/local/sbin/fortivpn-status 2>&1)
+    status=$?
+    if (( status != 0 )); then
+        message_error "Could not retrieve status:\n$output"
+        return
+    fi
+    tmp=$(mktemp)
+    printf '%s\n' "$output" >"$tmp"
+    zenity --text-info --title="$title — status" --filename="$tmp" \
+        --width=850 --height=560 --font='Monospace 10'
+    rm -f "$tmp"
+}
+
+command=${1:-}
+if [[ "$command" == --new ]]; then
+    new_profile
+    exit 0
+fi
+
+while true; do
+    action=$(zenity --list --title="$title" \
+        --text='Manage your FortiGate VPN accounts' --width=480 --height=420 \
+        --print-column=1 --column='Action' --column='Description' \
+        'Connect' 'Choose a profile and start the VPN' \
+        'Disconnect' 'Close the active connection' \
+        'Status' 'View the connection and installed routes' \
+        'New profile' 'Add another VPN account' \
+        'Edit profile' 'Change credentials, Local ID, or networks' \
+        'Delete profile' 'Delete a saved account') || exit 0
+    case "$action" in
+        Connect) connect_profile ;;
+        Disconnect) disconnect_profile ;;
+        Status) show_status ;;
+        'New profile') new_profile ;;
+        'Edit profile') edit_profile ;;
+        'Delete profile') delete_profile ;;
+    esac
+done

@@ -1,0 +1,10 @@
+/dist/*
+!/dist/.gitkeep
+/release/
+*.deb
+*.ddeb
+*.tar.gz
+__pycache__/
+*.pyc
+*.swp
+*~

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( EUID != 0 )); then
+    echo "Usage: pkexec fortivpn-status" >&2
+    exit 1
+fi
+
+if [[ -r /run/fortivpn/active-profile ]]; then
+    slug=$(</run/fortivpn/active-profile)
+    profile_name=''
+    if [[ "$slug" =~ ^[a-z0-9][a-z0-9_-]{0,47}$ ]]; then
+        profile_name=$(/usr/local/sbin/fortivpn-profile show "$slug" 2>/dev/null | head -n1 || true)
+    fi
+    echo "Selected profile: ${profile_name:-$slug}"
+else
+    echo "Selected profile: none"
+fi
+echo
+swanctl --list-sas
+echo
+ip xfrm policy

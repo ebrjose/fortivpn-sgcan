@@ -1,0 +1,6 @@
+# Root (charon) posts the request; the desktop user supplies the OTP. The
+# directory itself is not group-writable, preventing either endpoint from
+# replacing the FIFO or request file.
+d /run/fortivpn             0750 root @VPN_GROUP@ -
+p /run/fortivpn/otp.pipe    0660 root @VPN_GROUP@ -
+f /run/fortivpn/otp.request 0660 root @VPN_GROUP@ - IDLE

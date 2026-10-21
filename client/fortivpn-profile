@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+profiles_dir=/etc/fortivpn/profiles
+index_file=/var/lib/fortivpn/profiles.index
+active_file=/run/fortivpn/active-profile
+
+die() {
+    echo "$*" >&2
+    exit 1
+}
+
+require_root() {
+    (( EUID == 0 )) || die "Run this program through pkexec or sudo."
+}
+
+valid_slug() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,47}$ ]]
+}
+
+encode() {
+    printf '%s' "$1" | base64 -w0
+}
+
+decode() {
+    printf '%s' "$1" | base64 -d
+}
+
+field() {
+    local key=$1 file=$2
+    sed -n "s/^${key}=//p" "$file" | head -n1
+}
+
+validate_name() {
+    [[ -n "$1" && ${#1} -le 64 && "$1" != *$'\t'* ]] ||
+        die "The profile name must be between 1 and 64 characters."
+}
+
+validate_gateway() {
+    [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]] ||
+        die "The FortiGate address is invalid."
+}
+
+validate_identity() {
+    local label=$1 value=$2
+    [[ "$value" =~ ^[A-Za-z0-9._@+:/-]{1,128}$ ]] ||
+        die "$label contains unsupported characters."
+}
+
+validate_ranges() {
+    local input=${1//[[:space:]]/} item ip prefix octet
+    [[ -n "$input" ]] || die "At least one remote network is required."
+    IFS=',' read -ra items <<<"$input"
+    for item in "${items[@]}"; do
+        [[ "$item" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] ||
+            die "Invalid network: $item (use CIDR notation, for example 198.51.100.0/24)."
+        ip=${item%/*}
+        prefix=${item#*/}
+        IFS='.' read -ra octets <<<"$ip"
+        for octet in "${octets[@]}"; do
+            (( 10#$octet <= 255 )) || die "Invalid network: $item"
+        done
+        if [[ "$prefix" == 0 && "$ip" != 0.0.0.0 ]]; then
+            die "Use exactly 0.0.0.0/0 for a default route."
+        fi
+    done
+    printf '%s' "$input"
+}
+
+make_slug() {
+    local slug
+    slug=$(printf '%s' "$1" | tr '[:upper:] ' '[:lower:]-' |
+        sed -E 's/[^a-z0-9_-]+/-/g; s/-+/-/g; s/^[-_]+//; s/[-_]+$//' | cut -c1-48)
+    [[ -n "$slug" ]] || slug="profile-$(date +%s)"
+    printf '%s' "$slug"
+}
+
+profile_path() {
+    valid_slug "$1" || die "Invalid profile identifier."
+    printf '%s/%s.profile' "$profiles_dir" "$1"
+}
+
+refresh_index() {
+    local tmp file slug name local_id gateway ranges
+    install -d -o root -g root -m 755 /var/lib/fortivpn
+    tmp=$(mktemp /var/lib/fortivpn/.profiles.XXXXXX)
+    trap 'rm -f "$tmp"' RETURN
+    for file in "$profiles_dir"/*.profile; do
+        [[ -f "$file" ]] || continue
+        slug=${file##*/}
+        slug=${slug%.profile}
+        name=$(decode "$(field NAME_B64 "$file")")
+        local_id=$(decode "$(field LOCAL_ID_B64 "$file")")
+        gateway=$(field GATEWAY "$file")
+        ranges=$(field REMOTE_TS "$file")
+        printf '%s\t%s\t%s\t%s\t%s\n' "$slug" "$name" "$local_id" "$gateway" "$ranges" >>"$tmp"
+    done
+    sort -t $'\t' -k2,2f -o "$tmp" "$tmp"
+    install -o root -g root -m 644 "$tmp" "$index_file"
+    rm -f "$tmp"
+    trap - RETURN
+}
+
+save_profile() {
+    local requested_slug=$1 name gateway local_id vpn_user ranges vpn_psk vpn_password
+    local slug path old_psk='' old_password='' tmp
+    IFS= read -r name || true
+    IFS= read -r gateway || true
+    IFS= read -r local_id || true
+    IFS= read -r vpn_user || true
+    IFS= read -r ranges || true
+    IFS= read -r vpn_psk || true
+    IFS= read -r vpn_password || true
+
+    validate_name "$name"
+    validate_gateway "$gateway"
+    validate_identity "The Local ID" "$local_id"
+    validate_identity "The username" "$vpn_user"
+    ranges=$(validate_ranges "$ranges")
+
+    if [[ "$requested_slug" == new ]]; then
+        slug=$(make_slug "$name")
+        path=$(profile_path "$slug")
+        [[ ! -e "$path" ]] || die "A profile with an equivalent name already exists."
+        [[ -n "$vpn_psk" && -n "$vpn_password" ]] ||
+            die "The PSK and password are required for a new profile."
+    else
+        slug=$requested_slug
+        path=$(profile_path "$slug")
+        [[ -f "$path" ]] || die "The requested profile does not exist."
+        old_psk=$(field PSK_B64 "$path")
+        old_password=$(field PASSWORD_B64 "$path")
+    fi
+
+    [[ -n "$vpn_psk" ]] || [[ -n "$old_psk" ]] || die "The PSK cannot be empty."
+    [[ -n "$vpn_password" ]] || [[ -n "$old_password" ]] || die "The password cannot be empty."
+
+    umask 077
+    install -d -o root -g root -m 700 "$profiles_dir"
+    tmp=$(mktemp "$profiles_dir/.profile.XXXXXX")
+    trap 'rm -f "$tmp"; unset vpn_psk vpn_password' RETURN
+    {
+        printf 'NAME_B64=%s\n' "$(encode "$name")"
+        printf 'GATEWAY=%s\n' "$gateway"
+        printf 'LOCAL_ID_B64=%s\n' "$(encode "$local_id")"
+        printf 'VPN_USER_B64=%s\n' "$(encode "$vpn_user")"
+        if [[ -n "$vpn_psk" ]]; then
+            printf 'PSK_B64=%s\n' "$(encode "$vpn_psk")"
+        else
+            printf 'PSK_B64=%s\n' "$old_psk"
+        fi
+        if [[ -n "$vpn_password" ]]; then
+            printf 'PASSWORD_B64=%s\n' "$(encode "$vpn_password")"
+        else
+            printf 'PASSWORD_B64=%s\n' "$old_password"
+        fi
+        printf 'REMOTE_TS=%s\n' "$ranges"
+    } >"$tmp"
+    install -o root -g root -m 600 "$tmp" "$path"
+    rm -f "$tmp"
+    trap - RETURN
+    unset vpn_psk vpn_password
+    refresh_index
+    printf '%s\n' "$slug"
+}
+
+show_profile() {
+    local file
+    file=$(profile_path "$1")
+    [[ -f "$file" ]] || die "The requested profile does not exist."
+    decode "$(field NAME_B64 "$file")"; printf '\n'
+    field GATEWAY "$file"
+    decode "$(field LOCAL_ID_B64 "$file")"; printf '\n'
+    decode "$(field VPN_USER_B64 "$file")"; printf '\n'
+    field REMOTE_TS "$file"
+}
+
+escape_swan() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+render_profile() {
+    local slug=$1 file name gateway local_id vpn_user ranges psk_b64 password_b64
+    local cfg_tmp fct_tmp uid_value os_version='Linux'
+    file=$(profile_path "$slug")
+    [[ -f "$file" ]] || die "The requested profile does not exist."
+    name=$(decode "$(field NAME_B64 "$file")")
+    gateway=$(field GATEWAY "$file")
+    local_id=$(decode "$(field LOCAL_ID_B64 "$file")")
+    vpn_user=$(decode "$(field VPN_USER_B64 "$file")")
+    ranges=$(field REMOTE_TS "$file")
+    psk_b64=$(field PSK_B64 "$file")
+    password_b64=$(field PASSWORD_B64 "$file")
+
+    gateway=$(escape_swan "$gateway")
+    local_id=$(escape_swan "$local_id")
+    vpn_user=$(escape_swan "$vpn_user")
+
+    umask 077
+    install -d -o root -g root -m 700 /etc/swanctl/conf.d /etc/strongswan.d
+    cfg_tmp=$(mktemp /etc/swanctl/conf.d/.fortivpn-active.XXXXXX)
+    fct_tmp=$(mktemp /etc/strongswan.d/.fct_data.XXXXXX)
+    trap 'rm -f "$cfg_tmp" "$fct_tmp"' RETURN
+    {
+        printf '%s\n' 'connections {'
+        printf '    fortigate-%s {\n' "$slug"
+        printf '%s\n' '        version = 2'
+        printf '        remote_addrs = "%s"\n' "$gateway"
+        printf '%s\n' '        proposals = aes256-sha256-prfsha256-modp2048,aes256-sha256-prfsha256-ecp384'
+        printf '%s\n' '        vips = 0.0.0.0' '        mobike = no' '        fragmentation = yes' '        dpd_delay = 30s' '        reauth_time = 0s' '        rekey_time = 86400s' '        over_time = 1800s' '        rand_time = 0s'
+        printf '%s\n' '        local-eap {' '            auth = eap-mschapv2'
+        printf '            id = "%s"\n' "$local_id"
+        printf '            eap_id = "%s"\n' "$vpn_user"
+        printf '%s\n' '        }' '        remote-psk {' '            auth = psk' '        }' '        children {'
+        printf '            fortigate-%s-lan {\n' "$slug"
+        printf '%s\n' '                local_ts = 0.0.0.0/0'
+        printf '                remote_ts = %s\n' "$ranges"
+        printf '%s\n' '                esp_proposals = aes256-sha256-modp2048,aes256-sha256-ecp384' '                mode = tunnel' '                start_action = none' '                close_action = none' '                dpd_action = clear' '                rekey_time = 43200s' '                life_time = 45000s' '                rand_time = 0s' '            }' '        }' '    }' '}' '' 'secrets {'
+        printf '    ike-fortigate-%s {\n        secret = 0s%s\n    }\n' "$slug" "$psk_b64"
+        printf '    eap-fortigate-%s {\n        id = "%s"\n        secret = 0s%s\n    }\n' "$slug" "$vpn_user" "$password_b64"
+        printf '%s\n' '}'
+    } >"$cfg_tmp"
+
+    uid_value=''
+    if [[ -r /etc/strongswan.d/fct_data.txt ]]; then
+        uid_value=$(sed -n 's/^UID=//p' /etc/strongswan.d/fct_data.txt | head -n1)
+    fi
+    if [[ ! "$uid_value" =~ ^[A-F0-9]{32}$ ]]; then
+        uid_value=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n' | tr 'a-f' 'A-F')
+    fi
+    if [[ -r /etc/os-release ]]; then
+        os_version=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | head -n1 | sed 's/^"//; s/"$//')
+    fi
+    {
+        printf '%s\n' 'VER=1' 'FCTVER=7.4.3.5411' "UID=$uid_value" 'IP=192.0.2.1' 'MAC=00-00-00-00-00-00;' 'HOST=vpnclient'
+        printf 'USER=%s\n' "$vpn_user"
+        printf 'OSVER=%s\n' "$os_version"
+        printf '%s\n' 'REG_STATUS=0'
+    } >"$fct_tmp"
+
+    install -o root -g root -m 600 "$cfg_tmp" /etc/swanctl/conf.d/fortivpn-active.conf
+    install -o root -g root -m 600 "$fct_tmp" /etc/strongswan.d/fct_data.txt
+    [[ -d /run/fortivpn ]] || systemd-tmpfiles --create /etc/tmpfiles.d/fortivpn.conf
+    printf '%s\n' "$slug" >/run/fortivpn/rendered-profile
+    chmod 600 /run/fortivpn/rendered-profile
+    rm -f "$cfg_tmp" "$fct_tmp"
+    trap - RETURN
+    printf '%s\n' "$name"
+}
+
+import_legacy() {
+    local legacy=/etc/swanctl/conf.d/fortigate.conf target slug=legacy-vpn
+    local name='Imported VPN' gateway local_id vpn_user ranges psk_b64 password_b64 tmp
+    target=$(profile_path "$slug")
+    if [[ -f "$target" ]]; then
+        [[ ! -f "$legacy" ]] || mv "$legacy" "${legacy}.legacy-disabled"
+        refresh_index
+        return 0
+    fi
+    [[ -r "$legacy" ]] || return 0
+    gateway=$(sed -n 's/^[[:space:]]*remote_addrs[[:space:]]*=[[:space:]]*//p' "$legacy" | head -n1 | tr -d '"')
+    local_id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$legacy" | head -n1)
+    vpn_user=$(sed -n 's/^[[:space:]]*eap_id[[:space:]]*=[[:space:]]*"\(.*\)"/\1/p' "$legacy" | head -n1)
+    ranges=$(sed -n 's/^[[:space:]]*remote_ts[[:space:]]*=[[:space:]]*//p' "$legacy" | head -n1 | tr -d '[:space:]')
+    mapfile -t secrets < <(sed -n 's/^[[:space:]]*secret[[:space:]]*=[[:space:]]*0s\(.*\)/\1/p' "$legacy")
+    psk_b64=${secrets[0]:-}
+    password_b64=${secrets[1]:-}
+    [[ -n "$gateway" && -n "$local_id" && -n "$vpn_user" && -n "$ranges" && -n "$psk_b64" && -n "$password_b64" ]] ||
+        die "The previous configuration could not be imported safely."
+    validate_gateway "$gateway"
+    validate_identity "The Local ID" "$local_id"
+    validate_identity "The username" "$vpn_user"
+    ranges=$(validate_ranges "$ranges")
+    umask 077
+    install -d -o root -g root -m 700 "$profiles_dir"
+    tmp=$(mktemp "$profiles_dir/.profile.XXXXXX")
+    {
+        printf 'NAME_B64=%s\n' "$(encode "$name")"
+        printf 'GATEWAY=%s\n' "$gateway"
+        printf 'LOCAL_ID_B64=%s\n' "$(encode "$local_id")"
+        printf 'VPN_USER_B64=%s\n' "$(encode "$vpn_user")"
+        printf 'PSK_B64=%s\n' "$psk_b64"
+        printf 'PASSWORD_B64=%s\n' "$password_b64"
+        printf 'REMOTE_TS=%s\n' "$ranges"
+    } >"$tmp"
+    install -o root -g root -m 600 "$tmp" "$target"
+    rm -f "$tmp"
+    mv "$legacy" "${legacy}.legacy-disabled"
+    refresh_index
+}
+
+delete_profile() {
+    local slug=$1 path
+    path=$(profile_path "$slug")
+    [[ -f "$path" ]] || die "The requested profile does not exist."
+    if [[ -r "$active_file" && "$(<"$active_file")" == "$slug" ]]; then
+        die "Disconnect the profile before deleting it."
+    fi
+    rm -f "$path"
+    if [[ -r /run/fortivpn/rendered-profile && "$(</run/fortivpn/rendered-profile)" == "$slug" ]]; then
+        rm -f /run/fortivpn/rendered-profile /etc/swanctl/conf.d/fortivpn-active.conf
+        systemctl restart strongswan
+    fi
+    refresh_index
+}
+
+require_root
+install -d -o root -g root -m 700 "$profiles_dir"
+case "${1:-}" in
+    save)
+        [[ "${3:-}" == --stdin ]] || die "Usage: fortivpn-profile save new|ID --stdin"
+        save_profile "${2:-}"
+        ;;
+    show) show_profile "${2:-}" ;;
+    render) render_profile "${2:-}" ;;
+    delete) delete_profile "${2:-}" ;;
+    import-legacy) import_legacy ;;
+    refresh-index) refresh_index ;;
+    *) die "Usage: fortivpn-profile {save|show|render|delete|import-legacy|refresh-index}" ;;
+esac

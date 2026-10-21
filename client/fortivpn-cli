@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+set -u
+
+index_file=${FORTIVPN_INDEX_FILE:-/var/lib/fortivpn/profiles.index}
+otp_request=/run/fortivpn/otp.request
+otp_pipe=/run/fortivpn/otp.pipe
+tty=/dev/tty
+root_prefix=()
+
+die() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+prepare_root() {
+    if (( EUID == 0 )); then
+        root_prefix=()
+    elif command -v sudo >/dev/null; then
+        sudo -v || die 'Could not obtain authorization through sudo.'
+        root_prefix=(sudo -n)
+    else
+        die 'This mode requires sudo or must be run as root.'
+    fi
+}
+
+run_root() {
+    "${root_prefix[@]}" "$@"
+}
+
+list_profiles() {
+    local slug name local_id gateway ranges found=0
+    printf '%-4s %-24s %-20s %-20s %s\n' N CONNECTION 'LOCAL ID' FORTIGATE NETWORKS
+    printf '%-4s %-24s %-20s %-20s %s\n' -- ------------------------ -------------------- -------------------- -----
+    if [[ -r "$index_file" ]]; then
+        while IFS=$'\t' read -r slug name local_id gateway ranges; do
+            [[ -n "$slug" ]] || continue
+            ((found += 1))
+            printf '%-4d %-24.24s %-20.20s %-20.20s %s\n' "$found" "$name" "$local_id" "$gateway" "$ranges"
+        done <"$index_file"
+    fi
+    (( found > 0 )) || printf '(No profiles configured)\n'
+}
+
+profile_exists() {
+    [[ -r "$index_file" ]] && awk -F '\t' -v id="$1" '$1 == id {found=1} END {exit !found}' "$index_file"
+}
+
+select_profile() {
+    local requested=${1:-} choice count slug name local_id gateway ranges
+    local slugs=() names=()
+    if [[ -n "$requested" ]]; then
+        profile_exists "$requested" || die "Profile '$requested' does not exist. Run 'fortivpn-cli list'."
+        printf '%s' "$requested"
+        return
+    fi
+    if [[ -r "$index_file" ]]; then
+        while IFS=$'\t' read -r slug name local_id gateway ranges; do
+            [[ -n "$slug" ]] || continue
+            slugs+=("$slug")
+            names+=("$name")
+        done <"$index_file"
+    fi
+    count=${#slugs[@]}
+    (( count > 0 )) || die "No profiles exist. Run 'fortivpn-cli add'."
+    list_profiles >"$tty"
+    while true; do
+        read -r -p 'Connection number: ' choice <"$tty" || exit 1
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )); then
+            printf '%s' "${slugs[choice-1]}"
+            return
+        fi
+        printf 'Invalid selection.\n' >"$tty"
+    done
+}
+
+prompt_value() {
+    local label=$1 default=${2:-} value
+    if [[ -n "$default" ]]; then
+        read -r -p "$label [$default]: " value <"$tty" || exit 1
+        printf '%s' "${value:-$default}"
+    else
+        read -r -p "$label: " value <"$tty" || exit 1
+        printf '%s' "$value"
+    fi
+}
+
+save_profile() {
+    local slug=$1 name=${2:-} gateway=${3:-} local_id=${4:-}
+    local vpn_user=${5:-} ranges=${6:-} psk password result status
+    printf '\nConnection names and Local IDs are separate fields.\n' >"$tty"
+    name=$(prompt_value 'Connection name' "$name") || exit $?
+    gateway=$(prompt_value 'FortiGate (IP or hostname)' "$gateway") || exit $?
+    local_id=$(prompt_value 'Local ID' "$local_id") || exit $?
+    vpn_user=$(prompt_value 'VPN username' "$vpn_user") || exit $?
+    ranges=$(prompt_value 'Comma-separated networks routed through the VPN' "$ranges") || exit $?
+    if [[ "$slug" == new ]]; then
+        read -r -s -p 'PSK: ' psk <"$tty" || exit 1
+        printf '\n' >"$tty"
+        read -r -s -p 'VPN password: ' password <"$tty" || exit 1
+        printf '\n' >"$tty"
+    else
+        read -r -s -p 'New PSK (Enter to keep current value): ' psk <"$tty" || exit 1
+        printf '\n' >"$tty"
+        read -r -s -p 'New password (Enter to keep current value): ' password <"$tty" || exit 1
+        printf '\n' >"$tty"
+    fi
+    prepare_root
+    result=$({
+        printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+            "$name" "$gateway" "$local_id" "$vpn_user" "$ranges" "$psk" "$password"
+    } | run_root /usr/local/sbin/fortivpn-profile save "$slug" --stdin 2>&1)
+    status=$?
+    unset psk password
+    (( status == 0 )) || die "$result"
+    printf 'Connection "%s" saved.\n' "$name"
+}
+
+add_profile() {
+    save_profile new
+}
+
+edit_profile() {
+    local slug data status
+    slug=$(select_profile "${1:-}") || exit $?
+    prepare_root
+    data=$(run_root /usr/local/sbin/fortivpn-profile show "$slug" 2>&1)
+    status=$?
+    (( status == 0 )) || die "$data"
+    mapfile -t fields <<<"$data"
+    save_profile "$slug" "${fields[0]:-}" "${fields[1]:-}" \
+        "${fields[2]:-}" "${fields[3]:-}" "${fields[4]:-}"
+}
+
+delete_profile() {
+    local slug name answer
+    slug=$(select_profile "${1:-}") || exit $?
+    name=$(awk -F '\t' -v id="$slug" '$1 == id {print $2; exit}' "$index_file")
+    read -r -p "Delete '${name:-$slug}' and its credentials [y/N]: " answer <"$tty" || exit 1
+    [[ "$answer" =~ ^[yY]$ ]] || {
+        echo 'Operation cancelled.'
+        return
+    }
+    prepare_root
+    run_root /usr/local/sbin/fortivpn-profile delete "$slug"
+    echo 'Connection deleted.'
+}
+
+restore_graphical_agent=0
+connect_pid=''
+connect_tmp=''
+
+connect_cleanup() {
+    local status=$?
+    if [[ -n "$connect_pid" ]] && kill -0 "$connect_pid" 2>/dev/null; then
+        kill "$connect_pid" 2>/dev/null || true
+    fi
+    [[ -z "$connect_tmp" ]] || rm -f "$connect_tmp"
+    if (( restore_graphical_agent )); then
+        systemctl --user start fortivpn-otp-agent.service >/dev/null 2>&1 || true
+    fi
+    return "$status"
+}
+
+connect_profile() {
+    local slug line nonce last_nonce='' otp status
+    slug=$(select_profile "${1:-}") || exit $?
+    prepare_root
+    if systemctl --user is-active --quiet fortivpn-otp-agent.service 2>/dev/null; then
+        systemctl --user stop fortivpn-otp-agent.service
+        restore_graphical_agent=1
+    fi
+    trap connect_cleanup EXIT
+    trap 'exit 130' INT TERM
+    [[ -r "$otp_request" && -p "$otp_pipe" ]] ||
+        die 'The OTP channel is unavailable for this user. Reinstall the package for this account.'
+    connect_tmp=$(mktemp /tmp/fortivpn-cli.XXXXXX)
+    run_root /usr/local/sbin/fortivpn-up "$slug" >"$connect_tmp" 2>&1 &
+    connect_pid=$!
+    printf 'Starting the connection; waiting for the OTP request...\n'
+
+    while kill -0 "$connect_pid" 2>/dev/null; do
+        line=$(sed -n '1p' "$otp_request" 2>/dev/null || true)
+        if [[ "$line" =~ ^REQUEST[[:space:]]+([^[:space:]]+)$ ]]; then
+            nonce=${BASH_REMATCH[1]}
+            if [[ "$nonce" != "$last_nonce" ]]; then
+                last_nonce=$nonce
+                while true; do
+                    read -r -s -p 'OTP received by email: ' otp <"$tty" || exit 1
+                    printf '\n' >"$tty"
+                    [[ "$otp" =~ ^[0-9]{4,8}$ ]] && break
+                    printf 'The OTP must contain 4 to 8 digits.\n' >"$tty"
+                done
+                printf '%s %s\n' "$nonce" "$otp" >"$otp_pipe"
+                unset otp
+            fi
+        fi
+        sleep 0.2
+    done
+    wait "$connect_pid"
+    status=$?
+    connect_pid=''
+    sed -n '1,160p' "$connect_tmp"
+    if (( status == 0 )); then
+        echo 'VPN connected. You may close this SSH session.'
+    else
+        die 'Could not establish the VPN.'
+    fi
+    trap - EXIT INT TERM
+    connect_cleanup
+}
+
+disconnect_profile() {
+    prepare_root
+    run_root /usr/local/sbin/fortivpn-down
+}
+
+show_status() {
+    prepare_root
+    run_root /usr/local/sbin/fortivpn-status
+}
+
+usage() {
+    cat <<'EOF'
+Usage: fortivpn-cli COMMAND [ID]
+
+  list             List saved connections
+  add              Create a connection
+  edit [ID]        Edit a connection
+  delete [ID]      Delete a connection
+  connect [ID]     Connect and request the OTP in the terminal
+  disconnect       Disconnect the active VPN
+  status           Show status and IPsec policies
+EOF
+}
+
+case "${1:-}" in
+    list) list_profiles ;;
+    add) add_profile ;;
+    edit) edit_profile "${2:-}" ;;
+    delete) delete_profile "${2:-}" ;;
+    connect) connect_profile "${2:-}" ;;
+    disconnect) disconnect_profile ;;
+    status) show_status ;;
+    -h|--help|help|'') usage ;;
+    *) usage >&2; exit 2 ;;
+esac

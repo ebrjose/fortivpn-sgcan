@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if (( EUID != 0 )); then
+    echo "Usage: pkexec fortivpn-down" >&2
+    exit 1
+fi
+
+active_file=/run/fortivpn/active-profile
+if [[ ! -r "$active_file" ]]; then
+    echo "No profile is marked as active."
+    exit 0
+fi
+slug=$(<"$active_file")
+[[ "$slug" =~ ^[a-z0-9][a-z0-9_-]{0,47}$ ]] || {
+    rm -f "$active_file"
+    echo "An invalid active state was removed." >&2
+    exit 1
+}
+swanctl --terminate --ike "fortigate-$slug" --timeout 15000 >/dev/null 2>&1 || true
+rm -f "$active_file"
+echo "VPN disconnected."
