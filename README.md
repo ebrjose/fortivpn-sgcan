@@ -14,6 +14,8 @@ This project reproduces a configuration validated against a real FortiGate.
 It is not an official Fortinet product and requires six small, auditable
 patches to strongSwan to implement proprietary FortiClient extensions.
 
+For a step-by-step guide on a clean machine, see [INSTALL.md](INSTALL.md).
+
 ## Supported systems
 
 | Ubuntu | Codename | Pinned strongSwan version | Architecture |
