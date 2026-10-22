@@ -193,8 +193,9 @@ contains packages built for both Ubuntu releases.
 - They must be reviewed again whenever the strongSwan version changes.
 - The FortiGate firewall remains responsible for authorizing destinations and
   users; client ranges only decide which traffic is sent into the tunnel.
-- Local IKE ports are ephemeral to avoid NAT conflicts when multiple machines
-  connect to the same FortiGate from one network.
+- The Local ID is sent as a KEY_ID identity, as FortiClient does; the
+  FortiGate uses it to select the dialup tunnel and its PSK.
+- Standard local IKE ports (UDP 500/4500) are used.
 
 Read [SECURITY.md](SECURITY.md) and [NOTICE.md](NOTICE.md) before distributing
 the artifacts.

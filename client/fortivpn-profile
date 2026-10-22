@@ -209,7 +209,10 @@ render_profile() {
         printf '%s\n' '        proposals = aes256-sha256-prfsha256-modp2048,aes256-sha256-prfsha256-ecp384'
         printf '%s\n' '        vips = 0.0.0.0' '        mobike = no' '        fragmentation = yes' '        dpd_delay = 30s' '        reauth_time = 0s' '        rekey_time = 86400s' '        over_time = 1800s' '        rand_time = 0s'
         printf '%s\n' '        local-eap {' '            auth = eap-mschapv2'
-        printf '            id = "%s"\n' "$local_id"
+        # FortiGate matches the dialup tunnel (peer ID) against a KEY_ID
+        # identity, as FortiClient sends it; strongSwan would otherwise send
+        # the Local ID as an FQDN and the gateway selects another tunnel/PSK.
+        printf '            id = "keyid:%s"\n' "$local_id"
         printf '            eap_id = "%s"\n' "$vpn_user"
         printf '%s\n' '        }' '        remote-psk {' '            auth = psk' '        }' '        children {'
         printf '            fortigate-%s-lan {\n' "$slug"
