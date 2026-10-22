@@ -35,8 +35,10 @@ for a newer release of this project.
 
 ```bash
 sudo apt update
-sudo apt install git pkexec
+sudo apt install pkexec wget
 ```
+
+Option B below also needs `git` and Docker.
 
 strongSwan itself does not need to be installed beforehand; the installer
 installs it.
@@ -48,20 +50,18 @@ artifacts and are not committed. Choose one of the two options below.
 
 ### Option A: download a release (no Docker needed)
 
-Download both files from the project's GitHub Releases page:
+Download the bundle and its checksum from the latest
+[GitHub release](https://github.com/ebrjose/fortivpn-sgcan/releases/latest):
 
 ```bash
-V=v1.0.0
+mkdir -p ~/fortivpn && cd ~/fortivpn
 F=fortivpn-sgcan-ubuntu-24.04-26.04-amd64.tar.gz
-wget "https://github.com/ebrjose/fortivpn-sgcan/releases/download/$V/$F" \
-     "https://github.com/ebrjose/fortivpn-sgcan/releases/download/$V/$F.sha256"
+wget "https://github.com/ebrjose/fortivpn-sgcan/releases/latest/download/$F" \
+     "https://github.com/ebrjose/fortivpn-sgcan/releases/latest/download/$F.sha256"
 ```
 
-For a private repository, use the GitHub CLI instead:
-
-```bash
-gh release download v1.0.0 --repo ebrjose/fortivpn-sgcan
-```
+To install a specific version instead, replace `latest/download` with
+`download/<tag>`, for example `download/v1.0.0`.
 
 Verify and extract the bundle, then continue with
 [step 3](#3-install) from inside the extracted directory:
