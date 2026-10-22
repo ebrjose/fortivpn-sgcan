@@ -68,6 +68,7 @@ fi
 if [[ ! -e "$backup_dir/etc-before.tar.gz" ]]; then
     backup_paths=()
     for path in /etc/fortivpn /etc/swanctl/conf.d/fortivpn-active.conf \
+        /etc/strongswan.d/fortigate.conf /etc/strongswan.d/eap-gtc-otp.conf \
         /etc/strongswan.d/charon/fortigate.conf /etc/strongswan.d/charon/eap-gtc-otp.conf \
         /etc/tmpfiles.d/fortivpn.conf; do
         [[ ! -e "$path" ]] || backup_paths+=("$path")
@@ -88,8 +89,12 @@ install -o root -g root -m 755 "$repo_dir/client/fortivpn-down" /usr/local/sbin/
 install -o root -g root -m 755 "$repo_dir/client/fortivpn-status" /usr/local/sbin/fortivpn-status
 install -o root -g root -m 755 "$repo_dir/client/fortigate-otp-helper" /usr/local/sbin/fortigate-otp-helper
 install -o root -g root -m 755 "$repo_dir/client/fortivpn-cli" /usr/local/bin/fortivpn-cli
-install -o root -g root -m 644 "$repo_dir/config/eap-gtc-otp.conf" /etc/strongswan.d/charon/eap-gtc-otp.conf
-install -o root -g root -m 644 "$repo_dir/config/fortigate.conf" /etc/strongswan.d/charon/fortigate.conf
+# Both files open a top-level "charon {" section, so they must live directly in
+# /etc/strongswan.d: strongswan.conf includes strongswan.d/charon/*.conf inside
+# charon.plugins, where these settings would be silently ignored.
+install -o root -g root -m 644 "$repo_dir/config/eap-gtc-otp.conf" /etc/strongswan.d/eap-gtc-otp.conf
+install -o root -g root -m 644 "$repo_dir/config/fortigate.conf" /etc/strongswan.d/fortigate.conf
+rm -f /etc/strongswan.d/charon/eap-gtc-otp.conf /etc/strongswan.d/charon/fortigate.conf
 
 if [[ "$mode" == --desktop ]]; then
     install -o root -g root -m 755 "$repo_dir/client/fortivpn-manager" /usr/local/bin/fortivpn-manager
