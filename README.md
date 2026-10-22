@@ -193,6 +193,54 @@ cd fortivpn-sgcan
 The destination machine does not need Docker because the bundle already
 contains packages built for both Ubuntu releases.
 
+## Network ports and NAT
+
+The connection uses two UDP ports:
+
+| Port | Used for |
+|---|---|
+| 500 | `IKE_SA_INIT`: the initial exchange that negotiates the cryptography. |
+| 4500 | Everything after it once NAT is detected (NAT traversal, NAT-T): `IKE_AUTH` with the PSK, the username and password, and the OTP, followed by the encrypted tunnel traffic. |
+
+Most clients sit behind a NAT router: the machine has a private address and
+shares the router's public address. Plain IPsec does not survive NAT, so IKEv2
+detects it (`local host is behind NAT` in the log) and moves to UDP 4500.
+
+The router keeps a translation table entry for that traffic, and many consumer
+routers add an "IPsec passthrough" feature that handles port 4500 specially.
+That entry, or matching state on the FortiGate, can outlive an earlier session.
+The symptom is that `IKE_SA_INIT` on port 500 succeeds, but every `IKE_AUTH`
+request is retransmitted with no reply and no OTP prompt appears:
+
+```text
+[ENC] generating IKE_AUTH request 1 [ IDi N(INIT_CONTACT) ... ]
+[IKE] retransmit 1 of request with message ID 1
+...
+[IKE] establishing IKE_SA failed, peer not responding
+```
+
+A packet capture on the client during this failure showed the `IKE_AUTH`
+requests leaving from local port 4500 and no reply arriving at all. Changing
+only the local port to 4501 made the gateway answer at once.
+
+For this reason the client sends NAT-T traffic **from local UDP 4501**
+(`port_nat_t = 4501` in `/etc/strongswan.d/fortigate.conf`). Only the
+client-side source port changes: the FortiGate still receives on its standard
+UDP 500 and 4500, so no gateway change is needed. The router treats the traffic
+as ordinary UDP and creates a fresh translation entry.
+
+If the same symptom appears with port 4501, choose another free local port,
+then restart strongSwan and connect again:
+
+```bash
+sudo sed -i 's/^\(\s*port_nat_t = \).*/\14502/' /etc/strongswan.d/fortigate.conf
+sudo systemctl restart strongswan
+```
+
+Reinstalling or upgrading restores the default port 4501. Fully ephemeral local
+ports (`port = 0`, `port_nat_t = 0`) were also tested and left `IKE_AUTH`
+unanswered, so they are not used.
+
 ## Scope and warnings
 
 - The patches mimic proprietary behavior observed in FortiClient.
@@ -201,7 +249,8 @@ contains packages built for both Ubuntu releases.
   users; client ranges only decide which traffic is sent into the tunnel.
 - The Local ID is sent as a KEY_ID identity, as FortiClient does; the
   FortiGate uses it to select the dialup tunnel and its PSK.
-- Standard local IKE ports (UDP 500/4500) are used.
+- NAT-T uses local UDP 4501 instead of 4500; see
+  [Network ports and NAT](#network-ports-and-nat).
 - DNS servers announced by the FortiGate are not installed: they are usually
   outside the split-tunnel ranges, and installing them would break name
   resolution. Reach internal hosts by IP address, or add the DNS network to the

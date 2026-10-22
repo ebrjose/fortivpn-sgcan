@@ -219,5 +219,5 @@ sudo ./scripts/rollback.sh
 | `The repository installed strongSwan X, but this checkout is pinned to Y` | Ubuntu published a newer strongSwan. Update `versions/`, rebuild, or use a newer release. |
 | `Package SHA-256 verification failed` | The packages in `dist/` are corrupt or were modified. Download or build them again. |
 | `MAC mismatched` in the log | The PSK or the Local ID is wrong. Edit the connection and enter the tunnel PSK, not your password. |
-| No OTP window and the log shows `retransmit` of `IKE_AUTH` | The gateway is not answering, often a temporary block after several failed attempts, or another device on the same NAT network using the same FortiGate. Wait a few minutes and retry. |
+| No OTP window and the log shows `retransmit` of `IKE_AUTH` | `IKE_AUTH` replies are lost on the way back, usually stale router or gateway state for the local NAT-T port. See [Network ports and NAT](README.md#network-ports-and-nat) to switch to another local port. A temporary block after several failed attempts looks the same: wait a few minutes and retry. |
 | Connection fails right after entering the OTP | Check that the OTP agent is running: `systemctl --user status fortivpn-otp-agent`. |
