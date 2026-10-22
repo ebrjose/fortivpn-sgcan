@@ -9,6 +9,9 @@ while IFS= read -r script; do
 done < <(find client scripts -type f -exec sh -c \
     'for f do head -n1 "$f" | grep -q "bash" && printf "%s\n" "$f"; done' sh {} + | sort)
 
+bash -n get.sh
+bash -n install.sh
+
 python3 -m py_compile client/fortivpn-otp-agent.py
 rm -rf client/__pycache__
 
