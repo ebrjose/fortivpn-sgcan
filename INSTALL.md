@@ -114,13 +114,13 @@ A polkit dialog asks for your password. The installer:
 3. downloads the official packages to
    `/var/backups/fortivpn-sgcan/<release>-<version>/official/` for rollback;
 4. installs the two patched packages and places them on `apt-mark hold`;
-5. installs the client, the **FortiGate VPN** application, and the OTP agent
+5. installs the client, the **fortivpn-sgcan** application, and the OTP agent
    for your user session.
 
 It finishes with:
 
 ```text
-FortiVPN SGCAN installed for <user> on Ubuntu <release> (desktop).
+fortivpn-sgcan installed for <user> on Ubuntu <release> (desktop).
 ```
 
 ### Headless server (SSH)
@@ -136,7 +136,7 @@ terminal.
 
 ### Desktop
 
-Open **FortiGate VPN** from the application menu and create a connection with:
+Open **fortivpn-sgcan** from the application menu and create a connection with:
 
 - Connection name: any label.
 - FortiGate address: IP or DNS name.

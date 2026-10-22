@@ -6,7 +6,7 @@ set -euo pipefail
     exit 1
 }
 [[ -r /var/lib/fortivpn/install.env ]] || {
-    echo 'No FortiVPN SGCAN installation information was found.' >&2
+    echo 'No fortivpn-sgcan installation information was found.' >&2
     exit 1
 }
 # shellcheck disable=SC1091

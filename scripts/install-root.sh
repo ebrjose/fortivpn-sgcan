@@ -126,5 +126,5 @@ chmod 644 /var/lib/fortivpn/install.env
 
 systemctl daemon-reload
 systemctl restart strongswan
-echo "FortiVPN SGCAN installed for $target_user on Ubuntu $release (${mode#--})."
+echo "fortivpn-sgcan installed for $target_user on Ubuntu $release (${mode#--})."
 echo "Rollback available at: $backup_dir"

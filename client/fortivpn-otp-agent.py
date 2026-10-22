@@ -34,7 +34,7 @@ def prompt():
                 "zenity",
                 "--entry",
                 "--hide-text",
-                "--title=FortiGate VPN — OTP code",
+                "--title=fortivpn-sgcan — OTP code",
                 "--text=Enter the code received by email:",
                 "--width=360",
             ],

@@ -24,8 +24,8 @@ if [[ "$mode" == desktop ]]; then
     systemctl --user daemon-reload
     systemctl --user enable --now fortivpn-otp-agent.service
     if command -v zenity >/dev/null && [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
-        zenity --info --title='VPN FortiGate' --width=520 \
-            --text='Installation complete. Open "FortiGate VPN" from the application menu.'
+        zenity --info --title='fortivpn-sgcan' --width=520 \
+            --text='Installation complete. Open "fortivpn-sgcan" from the application menu.'
     else
         echo 'Installation complete. Run fortivpn-manager.'
     fi

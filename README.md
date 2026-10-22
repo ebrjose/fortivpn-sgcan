@@ -69,7 +69,7 @@ Build the artifacts for the local release first. Then run:
 ./install.sh --desktop
 ```
 
-The script uses `pkexec`, installs the **FortiGate VPN** application, and
+The script uses `pkexec`, installs the **fortivpn-sgcan** application, and
 enables the OTP agent in the user's session. The application can create, edit,
 connect, disconnect, and delete connections.
 

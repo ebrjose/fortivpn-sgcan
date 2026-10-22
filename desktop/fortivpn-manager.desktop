@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=FortiGate VPN
+Name=fortivpn-sgcan
 Comment=Manage FortiGate VPN profiles and connections
 Exec=/usr/local/bin/fortivpn-manager
 Icon=network-vpn

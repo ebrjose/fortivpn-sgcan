@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u
 
-title='FortiGate VPN'
+title='fortivpn-sgcan'
 index_file=/var/lib/fortivpn/profiles.index
 
 message_error() {
