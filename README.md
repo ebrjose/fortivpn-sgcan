@@ -14,6 +14,12 @@ This project reproduces a configuration validated against a real FortiGate.
 It is not an official Fortinet product and requires six small, auditable
 patches to strongSwan to implement proprietary FortiClient extensions.
 
+Quick install on Ubuntu 24.04 or 26.04 (amd64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ebrjose/fortivpn-sgcan/main/get.sh | bash
+```
+
 For a step-by-step guide on a clean machine, see [INSTALL.md](INSTALL.md).
 
 ## Supported systems
@@ -196,6 +202,10 @@ contains packages built for both Ubuntu releases.
 - The Local ID is sent as a KEY_ID identity, as FortiClient does; the
   FortiGate uses it to select the dialup tunnel and its PSK.
 - Standard local IKE ports (UDP 500/4500) are used.
+- DNS servers announced by the FortiGate are not installed: they are usually
+  outside the split-tunnel ranges, and installing them would break name
+  resolution. Reach internal hosts by IP address, or add the DNS network to the
+  connection's remote networks and configure the resolver manually.
 
 Read [SECURITY.md](SECURITY.md) and [NOTICE.md](NOTICE.md) before distributing
 the artifacts.

@@ -43,6 +43,32 @@ Option B below also needs `git` and Docker.
 strongSwan itself does not need to be installed beforehand; the installer
 installs it.
 
+## Quick install
+
+On a supported Ubuntu desktop, after installing the prerequisites from
+[step 1](#1-install-the-prerequisites) (`curl` works in place of `wget`), one
+command downloads the latest release, verifies its SHA-256 checksum, and runs
+the installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ebrjose/fortivpn-sgcan/main/get.sh | bash
+```
+
+For a headless server, append `-s -- --headless`; to pin a version, append
+`-s -- --version v1.0.1`. The bundle is kept in
+`~/.local/share/fortivpn-sgcan/`, which also holds `scripts/rollback.sh`.
+Then continue with [step 4](#4-create-a-connection).
+
+To review the script before running it, download it first:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/ebrjose/fortivpn-sgcan/main/get.sh
+less get.sh
+bash get.sh
+```
+
+The steps below describe the same process manually.
+
 ## 2. Get the packages
 
 A fresh clone does **not** contain the patched `.deb` files: they are generated
@@ -61,7 +87,7 @@ wget "https://github.com/ebrjose/fortivpn-sgcan/releases/latest/download/$F" \
 ```
 
 To install a specific version instead, replace `latest/download` with
-`download/<tag>`, for example `download/v1.0.0`.
+`download/<tag>`, for example `download/v1.0.1`.
 
 Verify and extract the bundle, then continue with
 [step 3](#3-install) from inside the extracted directory:
@@ -140,10 +166,12 @@ Open **fortivpn-sgcan** from the application menu and create a connection with:
 
 - Connection name: any label.
 - FortiGate address: IP or DNS name.
-- Local ID.
+- Local ID: exactly as provided by the FortiGate administrator (it selects
+  the VPN tunnel on the gateway).
 - Username.
-- PSK.
-- Password.
+- PSK (pre-shared key): the key of the VPN tunnel, shared by its users. It is
+  **not** your personal password.
+- Password: your personal VPN password.
 - Remote networks, comma-separated, for example `198.51.100.0/24,203.0.113.0/24`.
 
 Only the listed networks go through the VPN. Do not use `0.0.0.0/0` unless all
@@ -190,4 +218,6 @@ sudo ./scripts/rollback.sh
 | `Ubuntu packages are missing. Run: ./scripts/build-strongswan.sh …` | A fresh clone has no packages. Use Option A or Option B. |
 | `The repository installed strongSwan X, but this checkout is pinned to Y` | Ubuntu published a newer strongSwan. Update `versions/`, rebuild, or use a newer release. |
 | `Package SHA-256 verification failed` | The packages in `dist/` are corrupt or were modified. Download or build them again. |
+| `MAC mismatched` in the log | The PSK or the Local ID is wrong. Edit the connection and enter the tunnel PSK, not your password. |
+| No OTP window and the log shows `retransmit` of `IKE_AUTH` | The gateway is not answering, often a temporary block after several failed attempts, or another device on the same NAT network using the same FortiGate. Wait a few minutes and retry. |
 | Connection fails right after entering the OTP | Check that the OTP agent is running: `systemctl --user status fortivpn-otp-agent`. |
