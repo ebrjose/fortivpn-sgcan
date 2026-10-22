@@ -53,8 +53,13 @@ prompt_profile() {
     ranges=$(zenity --entry --title="$title — networks" \
         --text='Comma-separated networks routed through this VPN.\nExample: 198.51.100.0/24,203.0.113.0/24' \
         --entry-text="$ranges" --width=560) || return
-    psk=$(zenity --password --title="$psk_title") || return
-    password=$(zenity --password --title="$password_title") || return
+    # zenity --password always labels its field "Password", which makes the PSK
+    # and password prompts indistinguishable; use labelled hidden entries.
+    psk=$(zenity --entry --hide-text --title="$psk_title" \
+        --text='Pre-shared key (PSK) of the FortiGate VPN tunnel.\nThis is NOT your user password:' \
+        --width=480) || return
+    password=$(zenity --entry --hide-text --title="$password_title" \
+        --text="Password of the VPN user '$vpn_user':" --width=480) || return
 
     result=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
         "$name" "$gateway" "$local_id" "$vpn_user" "$ranges" "$psk" "$password" |
