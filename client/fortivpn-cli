@@ -15,6 +15,11 @@ die() {
 prepare_root() {
     if (( EUID == 0 )); then
         root_prefix=()
+    elif [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] && command -v pkexec >/dev/null &&
+        [[ -r /usr/share/polkit-1/actions/org.fortivpn-sgcan.policy ]]; then
+        # Desktop session: the installed polkit rule lets this user connect,
+        # disconnect, and read status without a password.
+        root_prefix=(pkexec)
     elif command -v sudo >/dev/null; then
         sudo -v || die 'Could not obtain authorization through sudo.'
         root_prefix=(sudo -n)
@@ -215,6 +220,25 @@ disconnect_profile() {
 }
 
 show_status() {
+    local sas slug name
+    # The installer lets the user's group query charon, so no privileges are
+    # needed for the summary; fall back to the privileged helper otherwise.
+    if sas=$(swanctl --list-sas 2>/dev/null); then
+        slug=$(cat /run/fortivpn/active-profile 2>/dev/null || true)
+        name=''
+        [[ -z "$slug" || ! -r "$index_file" ]] ||
+            name=$(awk -F '\t' -v id="$slug" '$1 == id {print $2; exit}' "$index_file")
+        if grep -q '^fortigate-.*ESTABLISHED' <<<"$sas"; then
+            printf 'Connected: %s\n\n' "${name:-${slug:-unknown profile}}"
+        elif grep -q '^fortigate-' <<<"$sas"; then
+            printf 'Connecting: %s\n\n' "${name:-${slug:-unknown profile}}"
+        else
+            printf 'Disconnected.\n'
+            return 0
+        fi
+        printf '%s\n' "$sas"
+        return 0
+    fi
     prepare_root
     run_root /usr/local/sbin/fortivpn-status
 }

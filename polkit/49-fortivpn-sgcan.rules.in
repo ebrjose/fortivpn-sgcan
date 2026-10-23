@@ -1,0 +1,11 @@
+// Let the desktop user who installed fortivpn-sgcan connect, disconnect, and
+// read the VPN status without a password, like FortiClient. Managing profiles
+// (which exposes and stores credentials) still requires authentication.
+polkit.addRule(function (action, subject) {
+    if ((action.id == "org.fortivpn-sgcan.connect" ||
+         action.id == "org.fortivpn-sgcan.disconnect" ||
+         action.id == "org.fortivpn-sgcan.status") &&
+        subject.user == "@VPN_USER@" && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

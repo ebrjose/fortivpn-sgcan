@@ -76,13 +76,32 @@ Build the artifacts for the local release first. Then run:
 ```
 
 The script uses `pkexec`, installs the **fortivpn-sgcan** application, and
-enables the OTP agent in the user's session. The application can create, edit,
-connect, disconnect, and delete connections.
+enables the OTP agent in the user's session.
 
-`pkexec` is not guaranteed to be installed on every Debian-family system. On
-the supported Ubuntu releases, install the `pkexec` package if the command is
-missing. Desktop authorization also requires an active polkit authentication
-agent. Headless mode deliberately uses `sudo` instead.
+The application is a Qt 6 (PyQt6) window that works on Ubuntu Desktop (GNOME)
+and Kubuntu (KDE Plasma):
+
+- a list of connections with their state, and a panel showing the selected
+  connection: FortiGate, Local ID, networks and, while connected, the VPN
+  address, connection time, and traffic;
+- one form with every connection field, validated before saving;
+- an OTP prompt when the FortiGate requests the code;
+- a tray icon while the application runs: green when connected, orange while
+  connecting, grey when disconnected, with Connect and Disconnect in its menu.
+  Closing the window keeps it in the tray; use **Quit** to exit. Ubuntu Desktop
+  shows it through its built-in AppIndicator extension.
+
+The installing user connects, disconnects, and reads the status **without a
+password**, as with FortiClient (see [SECURITY.md](SECURITY.md)). Creating,
+editing, and deleting connections still requires authentication. The status
+also reflects connections started from `fortivpn-cli`.
+
+The installer adds the `pkexec`, `polkitd`, and `python3-pyqt6` packages.
+Authentication for profile changes requires an active polkit agent, which both
+desktops provide. Headless mode deliberately uses `sudo` instead.
+
+In a desktop terminal, `fortivpn-cli` uses `pkexec` and therefore follows the
+same rules; `fortivpn-cli status` needs no privileges.
 
 Each connection requests these fields separately:
 

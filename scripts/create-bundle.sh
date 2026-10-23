@@ -15,7 +15,7 @@ trap 'rm -rf "$stage"' EXIT
 bundle_root="$stage/fortivpn-sgcan"
 mkdir -p "$bundle_root"
 for path in AGENTS.md README.md INSTALL.md SECURITY.md NOTICE.md LICENSE Makefile install.sh \
-    client config desktop systemd patches strongswan versions scripts tests dist; do
+    client config desktop polkit systemd patches strongswan versions scripts tests dist; do
     cp -a "$repo_dir/$path" "$bundle_root/"
 done
 rm -rf "$bundle_root/client/__pycache__"

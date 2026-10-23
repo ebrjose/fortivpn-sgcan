@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Privileged fortivpn-sgcan helpers run through pkexec. Everything requires
+     administrator authentication by default; 49-fortivpn-sgcan.rules lets the
+     installing desktop user connect, disconnect, and read status without it. -->
+<policyconfig>
+  <vendor>fortivpn-sgcan</vendor>
+
+  <action id="org.fortivpn-sgcan.connect">
+    <description>Connect a FortiGate VPN profile</description>
+    <message>Authentication is required to connect the VPN</message>
+    <icon_name>network-vpn</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/sbin/fortivpn-up</annotate>
+  </action>
+
+  <action id="org.fortivpn-sgcan.disconnect">
+    <description>Disconnect the FortiGate VPN</description>
+    <message>Authentication is required to disconnect the VPN</message>
+    <icon_name>network-vpn</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/sbin/fortivpn-down</annotate>
+  </action>
+
+  <action id="org.fortivpn-sgcan.status">
+    <description>Show the FortiGate VPN status</description>
+    <message>Authentication is required to show the VPN status</message>
+    <icon_name>network-vpn</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/sbin/fortivpn-status</annotate>
+  </action>
+
+  <action id="org.fortivpn-sgcan.manage-profiles">
+    <description>Manage FortiGate VPN profiles and credentials</description>
+    <message>Authentication is required to view or change VPN profiles</message>
+    <icon_name>network-vpn</icon_name>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/sbin/fortivpn-profile</annotate>
+  </action>
+</policyconfig>

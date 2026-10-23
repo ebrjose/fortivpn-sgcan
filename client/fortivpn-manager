@@ -1,174 +1,890 @@
-#!/usr/bin/env bash
-set -u
+#!/usr/bin/env python3
+"""fortivpn-sgcan desktop application (Qt 6).
 
-title='fortivpn-sgcan'
-index_file=/var/lib/fortivpn/profiles.index
+Lists the saved FortiGate connections, connects and disconnects them through
+the privileged helpers in /usr/local/sbin (via pkexec), asks for the email OTP
+when the gateway requests it, and shows the live tunnel status in the window
+and in a system tray icon while the application is running.
 
-message_error() {
-    zenity --error --title="$title" --text="$1" --width=560
-}
+Status is read with `swanctl --list-sas` without privileges: the installer
+grants the desktop user's group access to the strongSwan VICI socket.
+"""
 
-message_info() {
-    zenity --info --title="$title" --text="$1" --width=500
-}
+import errno
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
 
-select_profile() {
-    local prompt=${1:-'Select a profile:'}
-    local rows=() slug name local_id gateway ranges
-    if [[ -r "$index_file" ]]; then
-        while IFS=$'\t' read -r slug name local_id gateway ranges; do
-            [[ -n "$slug" ]] || continue
-            rows+=("$slug" "$name" "$local_id" "$gateway" "$ranges")
-        done <"$index_file"
-    fi
-    if (( ${#rows[@]} == 0 )); then
-        message_error 'No profiles exist yet. Create one with "New profile".'
+APP_NAME = "fortivpn-sgcan"
+INDEX_FILE = os.environ.get("FORTIVPN_INDEX_FILE", "/var/lib/fortivpn/profiles.index")
+ACTIVE_FILE = "/run/fortivpn/active-profile"
+OTP_REQUEST = "/run/fortivpn/otp.request"
+OTP_PIPE = "/run/fortivpn/otp.pipe"
+SBIN = "/usr/local/sbin"
+OTP_AGENT = "fortivpn-otp-agent.service"
+STATUS_INTERVAL_MS = 2000
+
+# Same rules as fortivpn-profile, so errors are shown before asking for
+# privileges.
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
+GATEWAY_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+IDENTITY_RE = re.compile(r"^[A-Za-z0-9._@+:/-]{1,128}$")
+CIDR_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d|[12]\d|3[0-2])$")
+OTP_RE = re.compile(r"^\d{4,8}$")
+REQUEST_RE = re.compile(r"^REQUEST (\S+)\s*$")
+
+# `swanctl --list-sas` output.
+SA_HEADER_RE = re.compile(r"^fortigate-(?P<slug>[a-z0-9][a-z0-9_-]*): #\d+, (?P<state>[A-Z_]+),")
+SA_LOCAL_RE = re.compile(r"^\s+local\s+'[^']*' @ \S+ \[(?P<vip>[0-9a-fA-F.:]+)\]")
+SA_ESTABLISHED_RE = re.compile(r"^\s+established (?P<seconds>\d+)s ago")
+CHILD_HEADER_RE = re.compile(r"^\s+fortigate-[a-z0-9_-]+-lan: #\d+, reqid \d+, (?P<state>[A-Z_]+),")
+CHILD_BYTES_RE = re.compile(r"^\s+(?P<dir>in|out)\s+[0-9a-f]+(?:_[io])?,\s+(?P<bytes>\d+) bytes")
+CHILD_REMOTE_RE = re.compile(r"^\s+remote\s+(?P<ts>[0-9./]+(?:\s+[0-9./]+)*)\s*$")
+
+
+@dataclass
+class Profile:
+    slug: str
+    name: str
+    local_id: str
+    gateway: str
+    ranges: str
+
+
+@dataclass
+class TunnelStatus:
+    state: str = "disconnected"  # disconnected | connecting | connected
+    slug: str = ""
+    virtual_ip: str = ""
+    remote_ts: list = field(default_factory=list)
+    established_seconds: int = 0
+    bytes_in: int = 0
+    bytes_out: int = 0
+
+
+def load_profiles(path=INDEX_FILE):
+    profiles = []
+    try:
+        with open(path, encoding="utf-8") as stream:
+            for line in stream:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) == 5 and SLUG_RE.match(parts[0]):
+                    profiles.append(Profile(*parts))
+    except OSError:
+        pass
+    return profiles
+
+
+def parse_list_sas(text):
+    """Return the status of the first fortigate-* IKE SA in swanctl output."""
+    status = TunnelStatus()
+    ike_state = child_state = ""
+    in_sa = False
+    for line in text.splitlines():
+        header = SA_HEADER_RE.match(line)
+        if header:
+            if in_sa:
+                break  # only one profile may be active at a time
+            in_sa = True
+            status.slug = header.group("slug")
+            ike_state = header.group("state")
+            continue
+        if not in_sa:
+            continue
+        if match := SA_LOCAL_RE.match(line):
+            status.virtual_ip = match.group("vip")
+        elif match := SA_ESTABLISHED_RE.match(line):
+            status.established_seconds = int(match.group("seconds"))
+        elif match := CHILD_HEADER_RE.match(line):
+            child_state = match.group("state")
+        elif match := CHILD_BYTES_RE.match(line):
+            key = "bytes_in" if match.group("dir") == "in" else "bytes_out"
+            setattr(status, key, getattr(status, key) + int(match.group("bytes")))
+        elif match := CHILD_REMOTE_RE.match(line):
+            status.remote_ts.extend(match.group("ts").split())
+    if not in_sa:
+        return TunnelStatus()
+    if ike_state == "ESTABLISHED" and child_state == "INSTALLED":
+        status.state = "connected"
+    else:
+        status.state = "connecting"
+    return status
+
+
+def validate_form(values, new):
+    """Return a list of (field, message) problems for the connection form."""
+    problems = []
+    name = values["name"]
+    if not name or len(name) > 64 or "\t" in name:
+        problems.append(("name", "Enter a name of 1 to 64 characters."))
+    if not GATEWAY_RE.match(values["gateway"]):
+        problems.append(("gateway", "Enter the FortiGate IP address or hostname."))
+    if not IDENTITY_RE.match(values["local_id"]):
+        problems.append(("local_id", "Use letters, digits and . _ @ + : / - only."))
+    if not IDENTITY_RE.match(values["user"]):
+        problems.append(("user", "Use letters, digits and . _ @ + : / - only."))
+    ranges = [item for item in re.sub(r"\s+", "", values["ranges"]).split(",") if item]
+    if not ranges:
+        problems.append(("ranges", "Enter at least one network, for example 198.51.100.0/24."))
+    for item in ranges:
+        match = CIDR_RE.match(item)
+        if not match or any(int(octet) > 255 for octet in match.groups()[:4]):
+            problems.append(("ranges", f"Invalid network: {item}. Use CIDR notation."))
+            break
+        if match.group(5) == "0" and item != "0.0.0.0/0":
+            problems.append(("ranges", "Use exactly 0.0.0.0/0 for a default route."))
+            break
+    if new and not values["psk"]:
+        problems.append(("psk", "The PSK is required."))
+    if new and not values["password"]:
+        problems.append(("password", "The password is required."))
+    return problems
+
+
+def format_bytes(count):
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if count < 1024 or unit == "GiB":
+            return f"{count:.0f} {unit}" if unit == "B" else f"{count:.1f} {unit}"
+        count /= 1024
+    return f"{count:.1f} GiB"
+
+
+def format_duration(seconds):
+    hours, rest = divmod(int(seconds), 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+try:
+    from PyQt6.QtCore import QProcess, QSize, Qt, QTimer, pyqtSignal
+    from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+    from PyQt6.QtWidgets import (
+        QApplication, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QFrame,
+        QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+        QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QStackedWidget,
+        QSystemTrayIcon, QVBoxLayout, QWidget,
+    )
+except ImportError:  # parsing helpers stay usable for tests without Qt
+    QApplication = None
+
+STATE_COLORS = {"connected": "#2e9d4f", "connecting": "#d18a00", "disconnected": "#8a8f98"}
+STATE_LABELS = {"connected": "Connected", "connecting": "Connecting…", "disconnected": "Disconnected"}
+
+
+def dot_icon(color, size=64, ring=False):
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    if ring:
+        painter.setBrush(QColor(color).lighter(160))
+        painter.drawEllipse(0, 0, size, size)
+    painter.setBrush(QColor(color))
+    margin = size // 6 if ring else size // 8
+    painter.drawEllipse(margin, margin, size - 2 * margin, size - 2 * margin)
+    painter.end()
+    return QIcon(pixmap)
+
+
+def run_privileged(program, *args, stdin_data=None, timeout=120):
+    """Run a fortivpn helper as root through pkexec; return (code, output)."""
+    try:
+        result = subprocess.run(
+            ["pkexec", f"{SBIN}/{program}", *args], input=stdin_data,
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return 1, str(error)
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode in (126, 127) and not output:
+        output = "Authorization was cancelled or denied."
+    return result.returncode, output
+
+
+class ConnectionDialog(QDialog):
+    """Single form with every field of a connection."""
+
+    FIELDS = [
+        ("name", "Connection name", "Any label to recognize this connection."),
+        ("gateway", "FortiGate address", "IP address or hostname of the VPN gateway."),
+        ("local_id", "Local ID", "Exactly as given by your administrator; it selects the tunnel."),
+        ("user", "Username", "Your VPN username."),
+        ("password", "Password", "Your personal VPN password."),
+        ("psk", "Pre-shared key (PSK)", "Key of the VPN tunnel. It is not your password."),
+        ("ranges", "Remote networks", "Comma-separated networks routed through the VPN."),
+    ]
+
+    def __init__(self, parent, values=None):
+        super().__init__(parent)
+        self.new = values is None
+        self.setWindowTitle("New connection" if self.new else "Edit connection")
+        self.setMinimumWidth(600)
+        self.inputs = {}
+        self.errors = {}
+
+        form = QFormLayout()
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setVerticalSpacing(4)
+        for key, label, help_text in self.FIELDS:
+            edit = QLineEdit()
+            if key in ("psk", "password"):
+                edit.setEchoMode(QLineEdit.EchoMode.Password)
+                if not self.new:
+                    edit.setPlaceholderText("Leave empty to keep the current value")
+            elif values:
+                edit.setText(values.get(key, ""))
+            if key == "ranges" and self.new:
+                edit.setPlaceholderText("198.51.100.0/24, 203.0.113.0/24")
+            self.inputs[key] = edit
+            help_label = QLabel(help_text)
+            help_label.setWordWrap(True)
+            help_label.setEnabled(False)
+            error_label = QLabel()
+            error_label.setStyleSheet("color: #c0392b;")
+            error_label.setWordWrap(True)
+            error_label.hide()
+            self.errors[key] = error_label
+            column = QVBoxLayout()
+            column.setSpacing(2)
+            column.addWidget(edit)
+            column.addWidget(help_label)
+            column.addWidget(error_label)
+            form.addRow(label, column)
+
+        show_secrets = QCheckBox("Show password and PSK")
+        show_secrets.toggled.connect(self.toggle_secrets)
+        form.addRow("", show_secrets)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.try_accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addSpacing(8)
+        layout.addWidget(buttons)
+        self.inputs["name"].setFocus()
+
+    def toggle_secrets(self, visible):
+        mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        self.inputs["psk"].setEchoMode(mode)
+        self.inputs["password"].setEchoMode(mode)
+
+    def values(self):
+        result = {key: edit.text().strip() for key, edit in self.inputs.items()}
+        # Secrets are used verbatim: surrounding spaces may be significant.
+        result["psk"] = self.inputs["psk"].text()
+        result["password"] = self.inputs["password"].text()
+        return result
+
+    def try_accept(self):
+        for label in self.errors.values():
+            label.hide()
+        values = self.values()
+        problems = validate_form(values, self.new)
+        if values["psk"] and values["psk"] == values["password"]:
+            problems.append(("psk", "The PSK must differ from your password."))
+        for key, message in problems:
+            self.errors[key].setText(message)
+            self.errors[key].show()
+        self.adjustSize()
+        if problems:
+            self.inputs[problems[0][0]].setFocus()
+            return
+        self.accept()
+
+
+class OtpDialog(QDialog):
+    def __init__(self, parent, profile_name):
+        super().__init__(parent)
+        self.setWindowTitle(f"{APP_NAME} — OTP code")
+        self.setMinimumWidth(380)
+        title = QLabel(f"<b>{profile_name}</b>")
+        text = QLabel("Enter the code received by email:")
+        self.code = QLineEdit()
+        self.code.setMaxLength(8)
+        self.code.setPlaceholderText("4 to 8 digits")
+        font = self.code.font()
+        font.setPointSizeF(font.pointSizeF() * 1.4)
+        self.code.setFont(font)
+        self.error = QLabel("The code must contain 4 to 8 digits.")
+        self.error.setStyleSheet("color: #c0392b;")
+        self.error.hide()
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.try_accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        for widget in (title, text, self.code, self.error, buttons):
+            layout.addWidget(widget)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+
+    def try_accept(self):
+        if OTP_RE.match(self.code.text().strip()):
+            self.accept()
+        else:
+            self.error.show()
+
+
+class Connector(QWidget):
+    """Runs fortivpn-up and answers the OTP request while it runs."""
+
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.hide()
+        self.process = None
+        self.profile = None
+        self.output = ""
+        self.last_nonce = None
+        self.agent_stopped = False
+        self.otp_timer = QTimer(self)
+        self.otp_timer.setInterval(300)
+        self.otp_timer.timeout.connect(self.check_otp_request)
+
+    def running(self):
+        return self.process is not None
+
+    def start(self, profile):
+        self.profile = profile
+        self.output = ""
+        self.last_nonce = self.read_nonce()  # ignore a request left from before
+        # The background agent would show a second OTP prompt.
+        if subprocess.run(["systemctl", "--user", "is-active", "--quiet", OTP_AGENT],
+                          check=False).returncode == 0:
+            subprocess.run(["systemctl", "--user", "stop", OTP_AGENT], check=False)
+            self.agent_stopped = True
+        self.process = QProcess(self)
+        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.process.readyReadStandardOutput.connect(self.collect)
+        self.process.finished.connect(self.done)
+        self.process.errorOccurred.connect(self.failed_to_start)
+        self.process.start("pkexec", [f"{SBIN}/fortivpn-up", profile.slug])
+        self.otp_timer.start()
+
+    def collect(self):
+        self.output += bytes(self.process.readAllStandardOutput()).decode(errors="replace")
+
+    @staticmethod
+    def read_nonce():
+        try:
+            with open(OTP_REQUEST, encoding="ascii") as stream:
+                match = REQUEST_RE.match(stream.read())
+                return match.group(1) if match else None
+        except OSError:
+            return None
+
+    def check_otp_request(self):
+        nonce = self.read_nonce()
+        if not nonce or nonce == self.last_nonce:
+            return
+        self.last_nonce = nonce
+        dialog = OtpDialog(self.parentWidget(), self.profile.name)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.output += "\nOTP entry cancelled.\n"
+            return
+        code = dialog.code.text().strip()
+        try:
+            descriptor = os.open(OTP_PIPE, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(descriptor, f"{nonce} {code}\n".encode("ascii"))
+            finally:
+                os.close(descriptor)
+        except OSError as error:
+            reason = "the request expired" if error.errno == errno.ENXIO else str(error)
+            self.output += f"\nCould not deliver the OTP: {reason}.\n"
+
+    def failed_to_start(self, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self.output += "pkexec could not be started."
+            self.done(1, None)
+
+    def done(self, code, _status=None):
+        if self.process is None:
+            return
+        self.otp_timer.stop()
+        self.collect()
+        self.process.deleteLater()
+        self.process = None
+        if self.agent_stopped:
+            subprocess.run(["systemctl", "--user", "start", OTP_AGENT], check=False)
+            self.agent_stopped = False
+        self.finished.emit(code == 0, self.output.strip())
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(QIcon.fromTheme("network-vpn", dot_icon(STATE_COLORS["connected"])))
+        self.resize(820, 500)
+        self.profiles = []
+        self.status = TunnelStatus()
+        self.status_error = ""
+        self.pending_slug = ""  # profile being connected by this window
+        self.quitting = False
+        self.tray_hint_shown = False
+        self.status_process = None
+
+        self.connector = Connector(self)
+        self.connector.finished.connect(self.connect_finished)
+        self.build_ui()
+        self.build_tray()
+        self.reload_profiles()
+
+        self.timer = QTimer(self)
+        self.timer.setInterval(STATUS_INTERVAL_MS)
+        self.timer.timeout.connect(self.poll_status)
+        self.timer.start()
+        self.poll_status()
+
+    # ---- layout -------------------------------------------------------
+    def build_ui(self):
+        self.list = QListWidget()
+        self.list.setIconSize(QSize(14, 14))
+        self.list.setMinimumWidth(230)
+        self.list.currentRowChanged.connect(lambda _row: self.refresh_details())
+        self.list.itemDoubleClicked.connect(lambda _item: self.toggle_connection())
+
+        new_button = QPushButton(QIcon.fromTheme("list-add"), "New")
+        new_button.clicked.connect(self.new_profile)
+        self.edit_button = QPushButton(QIcon.fromTheme("document-edit"), "Edit")
+        self.edit_button.clicked.connect(self.edit_profile)
+        self.delete_button = QPushButton(QIcon.fromTheme("edit-delete"), "Delete")
+        self.delete_button.clicked.connect(self.delete_profile)
+        list_buttons = QHBoxLayout()
+        for button in (new_button, self.edit_button, self.delete_button):
+            list_buttons.addWidget(button)
+
+        left = QVBoxLayout()
+        heading = QLabel("Connections")
+        heading.setStyleSheet("font-weight: 600;")
+        left.addWidget(heading)
+        left.addWidget(self.list, 1)
+        left.addLayout(list_buttons)
+
+        # Right panel: details and status of the selected connection.
+        self.title = QLabel()
+        title_font = self.title.font()
+        title_font.setPointSizeF(title_font.pointSizeF() * 1.6)
+        title_font.setWeight(QFont.Weight.DemiBold)
+        self.title.setFont(title_font)
+        self.state_icon = QLabel()
+        self.state_label = QLabel()
+        state_font = self.state_label.font()
+        state_font.setPointSizeF(state_font.pointSizeF() * 1.15)
+        self.state_label.setFont(state_font)
+        state_row = QHBoxLayout()
+        state_row.addWidget(self.state_icon)
+        state_row.addWidget(self.state_label, 1)
+
+        self.detail_labels = {}
+        details = QFormLayout()
+        details.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        for key, label in (("gateway", "FortiGate"), ("local_id", "Local ID"),
+                           ("ranges", "Networks"), ("vip", "VPN address"),
+                           ("duration", "Connected for"), ("bytes_in", "Received"),
+                           ("bytes_out", "Sent")):
+            value = QLabel("—")
+            value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            value.setWordWrap(True)
+            self.detail_labels[key] = value
+            details.addRow(f"{label}:", value)
+
+        self.action_button = QPushButton()
+        self.action_button.setMinimumHeight(40)
+        self.action_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.action_button.clicked.connect(self.toggle_connection)
+
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(140)
+        self.log.hide()
+        self.log_toggle = QPushButton("Show details")
+        self.log_toggle.setFlat(True)
+        self.log_toggle.hide()
+        self.log_toggle.clicked.connect(self.toggle_log)
+        self.message = QLabel()
+        self.message.setWordWrap(True)
+        self.message.hide()
+
+        card = QFrame()
+        card.setFrameShape(QFrame.Shape.StyledPanel)
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(20, 18, 20, 18)
+        card_layout.addWidget(self.title)
+        card_layout.addLayout(state_row)
+        card_layout.addSpacing(10)
+        card_layout.addLayout(details)
+        card_layout.addStretch(1)
+        card_layout.addWidget(self.message)
+        card_layout.addWidget(self.action_button)
+        card_layout.addWidget(self.log_toggle, 0, Qt.AlignmentFlag.AlignLeft)
+        card_layout.addWidget(self.log)
+
+        empty = QWidget()
+        empty_layout = QVBoxLayout(empty)
+        empty_layout.addStretch(1)
+        empty_text = QLabel("No connections yet.\nCreate one with the details provided by your administrator.")
+        empty_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        empty_button = QPushButton(QIcon.fromTheme("list-add"), "New connection")
+        empty_button.clicked.connect(self.new_profile)
+        empty_layout.addWidget(empty_text)
+        empty_layout.addWidget(empty_button, 0, Qt.AlignmentFlag.AlignCenter)
+        empty_layout.addStretch(2)
+
+        self.right = QStackedWidget()
+        self.right.addWidget(empty)
+        self.right.addWidget(card)
+
+        central = QWidget()
+        layout = QHBoxLayout(central)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(14)
+        layout.addLayout(left, 0)
+        layout.addWidget(self.right, 1)
+        self.setCentralWidget(central)
+
+    def build_tray(self):
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self.tray = QSystemTrayIcon(self)
+        self.tray_menu = QMenu()
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(self.tray_activated)
+        self.tray.show()
+
+    def update_tray(self):
+        if not self.tray:
+            return
+        state = self.display_state()
+        self.tray.setIcon(dot_icon(STATE_COLORS[state], ring=state == "connected"))
+        profile = self.profile_by_slug(self.status.slug or self.pending_slug)
+        name = profile.name if profile else ""
+        tooltip = f"{APP_NAME}: {STATE_LABELS[state]}" + (f" — {name}" if name and state != "disconnected" else "")
+        if state == "connected" and self.status.virtual_ip:
+            tooltip += f"\n{self.status.virtual_ip}"
+        self.tray.setToolTip(tooltip)
+
+        menu = self.tray_menu
+        menu.clear()
+        menu.addAction("Open", self.show_window)
+        menu.addSeparator()
+        busy = self.connector.running()
+        if state == "disconnected":
+            connect_menu = menu.addMenu("Connect")
+            connect_menu.setEnabled(bool(self.profiles) and not busy)
+            for item in self.profiles:
+                connect_menu.addAction(item.name, lambda p=item: self.connect_profile(p))
+        else:
+            action = menu.addAction(f"Disconnect {name}".strip(), self.disconnect)
+            action.setEnabled(state == "connected" or busy)
+        menu.addSeparator()
+        menu.addAction("Quit", self.quit)
+
+    # ---- data ---------------------------------------------------------
+    def profile_by_slug(self, slug):
+        return next((item for item in self.profiles if item.slug == slug), None)
+
+    def selected_profile(self):
+        row = self.list.currentRow()
+        return self.profiles[row] if 0 <= row < len(self.profiles) else None
+
+    def reload_profiles(self, select_slug=None):
+        current = select_slug or (self.selected_profile().slug if self.selected_profile() else None)
+        self.profiles = load_profiles()
+        self.list.blockSignals(True)
+        self.list.clear()
+        for item in self.profiles:
+            self.list.addItem(QListWidgetItem(item.name))
+        row = next((i for i, item in enumerate(self.profiles) if item.slug == current), 0)
+        if self.profiles:
+            self.list.setCurrentRow(row)
+        self.list.blockSignals(False)
+        self.right.setCurrentIndex(1 if self.profiles else 0)
+        self.refresh_details()
+
+    def display_state(self):
+        if self.connector.running():
+            return "connecting"
+        return self.status.state
+
+    def poll_status(self):
+        if self.status_process is not None:
+            return
+        if not shutil.which("swanctl"):
+            self.status_error = "swanctl is not installed."
+            return
+        self.status_process = QProcess(self)
+        self.status_process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.status_process.finished.connect(self.status_ready)
+        self.status_process.start("swanctl", ["--list-sas"])
+
+    def status_ready(self, code, _status):
+        output = bytes(self.status_process.readAllStandardOutput()).decode(errors="replace")
+        self.status_process.deleteLater()
+        self.status_process = None
+        previous = self.display_state()
+        if code == 0:
+            self.status = parse_list_sas(output)
+            self.status_error = ""
+        else:
+            self.status = TunnelStatus()
+            self.status_error = ("The connection status is unavailable. Log out and back in, "
+                                 "or reinstall fortivpn-sgcan for this user.")
+        current = self.display_state()
+        if previous != current:
+            self.notify_change(previous, current)
+        self.refresh_details()
+
+    def notify_change(self, previous, current):
+        if not self.tray or previous == "connecting" and current == "connecting":
+            return
+        profile = self.profile_by_slug(self.status.slug or self.pending_slug)
+        name = profile.name if profile else "VPN"
+        if current == "connected":
+            self.tray.showMessage(APP_NAME, f"{name} connected ({self.status.virtual_ip}).",
+                                  QSystemTrayIcon.MessageIcon.Information, 4000)
+        elif current == "disconnected" and previous == "connected":
+            self.tray.showMessage(APP_NAME, f"{name} disconnected.",
+                                  QSystemTrayIcon.MessageIcon.Information, 4000)
+
+    # ---- view ---------------------------------------------------------
+    def refresh_details(self):
+        state = self.display_state()
+        active_slug = self.status.slug if self.status.state != "disconnected" else ""
+        if self.connector.running():
+            active_slug = self.pending_slug
+        for row, item in enumerate(self.profiles):
+            item_state = state if item.slug == active_slug else "disconnected"
+            self.list.item(row).setIcon(dot_icon(STATE_COLORS[item_state]))
+
+        profile = self.selected_profile()
+        if profile:
+            selected_state = state if profile.slug == active_slug else "disconnected"
+            self.title.setText(profile.name)
+            self.state_icon.setPixmap(dot_icon(STATE_COLORS[selected_state]).pixmap(14, 14))
+            self.state_label.setText(STATE_LABELS[selected_state])
+            values = {"gateway": profile.gateway, "local_id": profile.local_id,
+                      "ranges": profile.ranges.replace(",", ", ")}
+            if selected_state == "connected":
+                values.update(
+                    vip=self.status.virtual_ip or "—",
+                    duration=format_duration(self.status.established_seconds),
+                    bytes_in=format_bytes(self.status.bytes_in),
+                    bytes_out=format_bytes(self.status.bytes_out))
+            for key, label in self.detail_labels.items():
+                label.setText(values.get(key, "—"))
+            other_active = active_slug and active_slug != profile.slug
+            if selected_state == "disconnected":
+                self.action_button.setText("Connect")
+                self.action_button.setEnabled(not self.connector.running())
+                self.action_button.setToolTip(
+                    "Connecting will disconnect the other active connection." if other_active else "")
+            elif selected_state == "connecting":
+                self.action_button.setText("Cancel")
+                self.action_button.setEnabled(True)
+            else:
+                self.action_button.setText("Disconnect")
+                self.action_button.setEnabled(True)
+            busy = profile.slug == active_slug
+            self.edit_button.setEnabled(not busy)
+            self.delete_button.setEnabled(not busy)
+        else:
+            self.edit_button.setEnabled(False)
+            self.delete_button.setEnabled(False)
+        if self.status_error:
+            self.show_message(self.status_error, error=True)
+        self.update_tray()
+
+    def show_message(self, text, error=False):
+        self.message.setText(text)
+        self.message.setStyleSheet("color: #c0392b;" if error else "")
+        self.message.setVisible(bool(text))
+
+    def set_log(self, text):
+        self.log.setPlainText(text)
+        self.log_toggle.setVisible(bool(text))
+        if not text:
+            self.log.hide()
+            self.log_toggle.setText("Show details")
+
+    def toggle_log(self):
+        visible = not self.log.isVisible()
+        self.log.setVisible(visible)
+        self.log_toggle.setText("Hide details" if visible else "Show details")
+
+    # ---- actions ------------------------------------------------------
+    def toggle_connection(self):
+        profile = self.selected_profile()
+        if not profile:
+            return
+        active = self.status.slug if self.status.state != "disconnected" else ""
+        if self.connector.running() or active == profile.slug:
+            self.disconnect()
+        else:
+            self.connect_profile(profile)
+
+    def connect_profile(self, profile):
+        if self.connector.running():
+            return
+        self.pending_slug = profile.slug
+        self.show_message(f"Connecting {profile.name}. A window will ask for the OTP when the "
+                          "FortiGate sends it.")
+        self.set_log("")
+        self.connector.start(profile)
+        self.refresh_details()
+
+    def connect_finished(self, ok, output):
+        profile = self.profile_by_slug(self.pending_slug)
+        name = profile.name if profile else "VPN"
+        self.pending_slug = ""
+        if ok:
+            self.show_message("")
+            self.set_log(output)
+        else:
+            hint = ""
+            if "MAC mismatched" in output:
+                hint = " Check the PSK and the Local ID."
+            elif "peer not responding" in output:
+                hint = " The FortiGate did not answer; wait a few minutes and retry."
+            elif "OTP" in output and "cancel" in output.lower():
+                hint = " The OTP was not entered."
+            self.show_message(f"Could not connect {name}.{hint}", error=True)
+            self.set_log(output)
+            if self.tray:
+                self.tray.showMessage(APP_NAME, f"Could not connect {name}.",
+                                      QSystemTrayIcon.MessageIcon.Warning, 5000)
+        self.poll_status()
+        self.refresh_details()
+
+    def disconnect(self):
+        code, output = run_privileged("fortivpn-down", timeout=30)
+        if code != 0:
+            self.show_message(f"Could not disconnect: {output}", error=True)
+        else:
+            self.show_message("")
+        self.poll_status()
+
+    def new_profile(self):
+        dialog = ConnectionDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.save_profile("new", dialog.values())
+
+    def edit_profile(self):
+        profile = self.selected_profile()
+        if not profile:
+            return
+        code, output = run_privileged("fortivpn-profile", "show", profile.slug, timeout=60)
+        if code != 0:
+            self.show_message(f"Could not read the connection: {output}", error=True)
+            return
+        lines = (output.splitlines() + [""] * 5)[:5]
+        values = dict(zip(("name", "gateway", "local_id", "user", "ranges"), lines))
+        dialog = ConnectionDialog(self, values)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.save_profile(profile.slug, dialog.values())
+
+    def save_profile(self, slug, values):
+        data = "".join(f"{values[key]}\n" for key in
+                       ("name", "gateway", "local_id", "user", "ranges", "psk", "password"))
+        code, output = run_privileged("fortivpn-profile", "save", slug, "--stdin",
+                                      stdin_data=data, timeout=60)
+        values.clear()
+        if code != 0:
+            QMessageBox.warning(self, APP_NAME, f"Could not save the connection:\n{output}")
+            return
+        saved_slug = output.splitlines()[-1].strip() if output else slug
+        self.reload_profiles(select_slug=saved_slug)
+        self.show_message("Connection saved.")
+
+    def delete_profile(self):
+        profile = self.selected_profile()
+        if not profile:
+            return
+        answer = QMessageBox.question(
+            self, APP_NAME, f"Delete '{profile.name}' and its stored credentials?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        code, output = run_privileged("fortivpn-profile", "delete", profile.slug, timeout=60)
+        if code != 0:
+            QMessageBox.warning(self, APP_NAME, f"Could not delete the connection:\n{output}")
+        self.reload_profiles()
+
+    # ---- window and tray ----------------------------------------------
+    def tray_activated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            if self.isVisible() and not self.isMinimized():
+                self.hide()
+            else:
+                self.show_window()
+
+    def show_window(self):
+        self.show()
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event):
+        if self.tray and not self.quitting:
+            event.ignore()
+            self.hide()
+            if not self.tray_hint_shown:
+                self.tray_hint_shown = True
+                self.tray.showMessage(APP_NAME, "Still running in the tray. Use Quit to close it.",
+                                      QSystemTrayIcon.MessageIcon.Information, 4000)
+            return
+        event.accept()
+
+    def quit(self):
+        if self.display_state() != "disconnected":
+            answer = QMessageBox.question(
+                self, APP_NAME, "The VPN stays connected after closing the application. Quit anyway?")
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self.quitting = True
+        QApplication.instance().quit()
+
+
+def main():
+    if QApplication is None:
+        print("fortivpn-manager requires PyQt6 (package python3-pyqt6).", file=sys.stderr)
         return 1
-    fi
-    zenity --list --title="$title" --text="$prompt" --width=820 --height=420 \
-        --hide-column=1 --print-column=1 \
-        --column='ID' --column='Connection' --column='Local ID' --column='FortiGate' --column='VPN networks' \
-        "${rows[@]}"
-}
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+    app.setDesktopFileName("fortivpn-manager")
+    app.setQuitOnLastWindowClosed(False)
 
-prompt_profile() {
-    local slug=$1 name=${2:-} gateway=${3:-} local_id=${4:-}
-    local vpn_user=${5:-} ranges=${6:-} psk password result status
-    local psk_title="$title — PSK" password_title="$title — password"
-    if [[ "$slug" != new ]]; then
-        psk_title="$psk_title (empty = keep current value)"
-        password_title="$password_title (empty = keep current value)"
-    fi
+    # Single instance per user: a second launch brings the window forward.
+    server_name = f"{APP_NAME}-{os.getuid()}"
+    probe = QLocalSocket()
+    probe.connectToServer(server_name)
+    if probe.waitForConnected(300):
+        probe.write(b"show")
+        probe.waitForBytesWritten(300)
+        return 0
+    QLocalServer.removeServer(server_name)
+    server = QLocalServer()
+    server.listen(server_name)
 
-    name=$(zenity --entry --title="$title — connection name" \
-        --text='Free-form name used to save and identify this connection:' --entry-text="$name" --width=480) || return
-    [[ -n "$name" ]] || return
-    gateway=$(zenity --entry --title="$title — server" \
-        --text='FortiGate IP address or hostname:' --entry-text="$gateway" --width=430) || return
-    local_id=$(zenity --entry --title="$title — Local ID" \
-        --text='Technical Local ID assigned by FortiGate (independent from the name):' \
-        --entry-text="$local_id" --width=520) || return
-    vpn_user=$(zenity --entry --title="$title — username" \
-        --text='VPN username:' --entry-text="$vpn_user" --width=430) || return
-    ranges=$(zenity --entry --title="$title — networks" \
-        --text='Comma-separated networks routed through this VPN.\nExample: 198.51.100.0/24,203.0.113.0/24' \
-        --entry-text="$ranges" --width=560) || return
-    # zenity --password always labels its field "Password", which makes the PSK
-    # and password prompts indistinguishable; use labelled hidden entries.
-    psk=$(zenity --entry --hide-text --title="$psk_title" \
-        --text='Pre-shared key (PSK) of the FortiGate VPN tunnel.\nThis is NOT your user password:' \
-        --width=480) || return
-    password=$(zenity --entry --hide-text --title="$password_title" \
-        --text="Password of the VPN user '$vpn_user':" --width=480) || return
+    window = MainWindow()
+    server.newConnection.connect(lambda: (server.nextPendingConnection(), window.show_window()))
+    window.show()
+    if not window.tray:
+        app.setQuitOnLastWindowClosed(True)
+    return app.exec()
 
-    result=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
-        "$name" "$gateway" "$local_id" "$vpn_user" "$ranges" "$psk" "$password" |
-        pkexec /usr/local/sbin/fortivpn-profile save "$slug" --stdin 2>&1)
-    status=$?
-    unset psk password
-    if (( status == 0 )); then
-        message_info "Profile '$name' saved."
-    else
-        message_error "Could not save the profile:\n$result"
-    fi
-}
 
-new_profile() {
-    prompt_profile new
-}
-
-edit_profile() {
-    local slug data status
-    slug=$(select_profile 'Select the profile to edit:') || return
-    data=$(pkexec /usr/local/sbin/fortivpn-profile show "$slug" 2>&1)
-    status=$?
-    if (( status != 0 )); then
-        message_error "Could not read the profile:\n$data"
-        return
-    fi
-    mapfile -t fields <<<"$data"
-    prompt_profile "$slug" "${fields[0]:-}" "${fields[1]:-}" \
-        "${fields[2]:-}" "${fields[3]:-}" "${fields[4]:-}"
-}
-
-delete_profile() {
-    local slug name result status
-    slug=$(select_profile 'Select the profile to delete:') || return
-    name=$(awk -F '\t' -v id="$slug" '$1 == id {print $2; exit}' "$index_file")
-    zenity --question --title="$title" \
-        --text="Delete profile '${name:-$slug}'?\n\nThis also deletes its saved credentials." \
-        --ok-label='Delete' --cancel-label='Cancel' --width=480 || return
-    result=$(pkexec /usr/local/sbin/fortivpn-profile delete "$slug" 2>&1)
-    status=$?
-    if (( status == 0 )); then
-        message_info 'Profile deleted.'
-    else
-        message_error "Could not delete the profile:\n$result"
-    fi
-}
-
-connect_profile() {
-    local slug name result status
-    slug=$(select_profile 'Select the account to connect:') || return
-    name=$(awk -F '\t' -v id="$slug" '$1 == id {print $2; exit}' "$index_file")
-    systemctl --user start fortivpn-otp-agent.service >/dev/null 2>&1 || true
-    result=$(pkexec /usr/local/sbin/fortivpn-up "$slug" 2>&1)
-    status=$?
-    if (( status == 0 )); then
-        message_info "'${name:-$slug}' is connected.\n\nOnly the networks defined in the profile go through the VPN."
-    else
-        message_error "Could not connect '${name:-$slug}':\n$result"
-    fi
-}
-
-disconnect_profile() {
-    local result status
-    result=$(pkexec /usr/local/sbin/fortivpn-down 2>&1)
-    status=$?
-    if (( status == 0 )); then
-        message_info "$result"
-    else
-        message_error "Could not disconnect:\n$result"
-    fi
-}
-
-show_status() {
-    local output status tmp
-    output=$(pkexec /usr/local/sbin/fortivpn-status 2>&1)
-    status=$?
-    if (( status != 0 )); then
-        message_error "Could not retrieve status:\n$output"
-        return
-    fi
-    tmp=$(mktemp)
-    printf '%s\n' "$output" >"$tmp"
-    zenity --text-info --title="$title — status" --filename="$tmp" \
-        --width=850 --height=560 --font='Monospace 10'
-    rm -f "$tmp"
-}
-
-command=${1:-}
-if [[ "$command" == --new ]]; then
-    new_profile
-    exit 0
-fi
-
-while true; do
-    action=$(zenity --list --title="$title" \
-        --text='Manage your FortiGate VPN accounts' --width=480 --height=420 \
-        --print-column=1 --column='Action' --column='Description' \
-        'Connect' 'Choose a profile and start the VPN' \
-        'Disconnect' 'Close the active connection' \
-        'Status' 'View the connection and installed routes' \
-        'New profile' 'Add another VPN account' \
-        'Edit profile' 'Change credentials, Local ID, or networks' \
-        'Delete profile' 'Delete a saved account') || exit 0
-    case "$action" in
-        Connect) connect_profile ;;
-        Disconnect) disconnect_profile ;;
-        Status) show_status ;;
-        'New profile') new_profile ;;
-        'Edit profile') edit_profile ;;
-        'Delete profile') delete_profile ;;
-    esac
-done
+if __name__ == "__main__":
+    sys.exit(main())

@@ -162,7 +162,8 @@ terminal.
 
 ### Desktop
 
-Open **fortivpn-sgcan** from the application menu and create a connection with:
+Open **fortivpn-sgcan** from the application menu, choose **New**, and fill in
+the form:
 
 - Connection name: any label.
 - FortiGate address: IP or DNS name.

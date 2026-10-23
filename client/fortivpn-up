@@ -26,7 +26,10 @@ swanctl --load-all >/dev/null
 echo "Starting $profile_name; a window will appear when the server requests the OTP..."
 if swanctl --initiate --child "fortigate-$slug-lan" --timeout 150000; then
     printf '%s\n' "$slug" >/run/fortivpn/active-profile
-    chmod 600 /run/fortivpn/active-profile
+    # Readable by the desktop user's group (the group of /run/fortivpn) so the
+    # application and fortivpn-cli can show the active profile.
+    chgrp --reference=/run/fortivpn /run/fortivpn/active-profile
+    chmod 640 /run/fortivpn/active-profile
 else
     rm -f /run/fortivpn/active-profile
     exit 1

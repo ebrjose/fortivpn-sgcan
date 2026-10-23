@@ -13,6 +13,14 @@ bash -n get.sh
 bash -n install.sh
 
 python3 -m py_compile client/fortivpn-otp-agent.py
+python3 - <<'PY'
+import importlib.machinery
+importlib.machinery.SourceFileLoader("fortivpn_manager", "client/fortivpn-manager").get_code("fortivpn_manager")
+PY
+python3 tests/test_manager.py
+if command -v xmllint >/dev/null; then
+    xmllint --noout polkit/org.fortivpn-sgcan.policy
+fi
 rm -rf client/__pycache__
 
 if command -v shellcheck >/dev/null; then

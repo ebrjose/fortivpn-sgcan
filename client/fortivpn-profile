@@ -197,7 +197,10 @@ render_profile() {
     vpn_user=$(escape_swan "$vpn_user")
 
     umask 077
-    install -d -o root -g root -m 700 /etc/swanctl/conf.d /etc/strongswan.d
+    install -d -o root -g root -m 700 /etc/swanctl/conf.d
+    # Keep the packaged 0755 mode: unprivileged swanctl (status) reads the
+    # settings here, and fct_data.txt itself is created 0600.
+    install -d -o root -g root -m 755 /etc/strongswan.d
     cfg_tmp=$(mktemp /etc/swanctl/conf.d/.fortivpn-active.XXXXXX)
     fct_tmp=$(mktemp /etc/strongswan.d/.fct_data.XXXXXX)
     trap 'rm -f "$cfg_tmp" "$fct_tmp"' RETURN

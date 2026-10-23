@@ -20,6 +20,22 @@ Base64 is not encryption. Actual protection comes from `root` ownership and
 mode `0600`. Systems with a stronger threat model should integrate a secret
 store or request credentials for every connection.
 
+## Desktop privileges
+
+In desktop mode the installer adds a polkit rule
+(`/etc/polkit-1/rules.d/49-fortivpn-sgcan.rules`) that lets the installing
+user, in a local active session, run `fortivpn-up`, `fortivpn-down`, and
+`fortivpn-status` without a password. Viewing, saving, or deleting profiles
+still requires administrator authentication. The OTP is still required for
+every connection.
+
+To read the status without privileges, a systemd drop-in
+(`/etc/systemd/system/strongswan.service.d/fortivpn-vici.conf`) gives the
+user's primary group access to the strongSwan VICI socket. VICI does not expose
+stored secrets, but any process running as that user can list, start, or stop
+IKE connections. Remove both files to require authentication for every
+operation again.
+
 ## OTP
 
 The strongSwan helper and the user exchange the OTP through a FIFO under

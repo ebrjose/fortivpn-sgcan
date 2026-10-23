@@ -50,7 +50,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 dependencies=(charon-systemd strongswan-swanctl libcharon-extra-plugins libstrongswan-extra-plugins python3)
 if [[ "$mode" == --desktop ]]; then
-    dependencies+=(zenity)
+    dependencies+=(zenity python3-pyqt6 pkexec polkitd)
 fi
 apt-get install -y "${dependencies[@]}"
 installed_version=$(dpkg-query -W -f='${Version}' strongswan-libcharon 2>/dev/null || true)
@@ -102,7 +102,21 @@ if [[ "$mode" == --desktop ]]; then
     install -o root -g root -m 755 "$repo_dir/client/fortivpn-otp-agent.py" /usr/local/libexec/fortivpn-otp-agent.py
     install -o root -g root -m 644 "$repo_dir/desktop/fortivpn-manager.desktop" /usr/share/applications/fortivpn-manager.desktop
     install -o root -g root -m 644 "$repo_dir/systemd/fortivpn-otp-agent.service" /etc/systemd/user/fortivpn-otp-agent.service
+    install -o root -g root -m 644 "$repo_dir/polkit/org.fortivpn-sgcan.policy" \
+        /usr/share/polkit-1/actions/org.fortivpn-sgcan.policy
+    install -d -o root -g root -m 755 /etc/polkit-1/rules.d
+    rules_tmp=$(mktemp)
+    sed "s/@VPN_USER@/$target_user/g" "$repo_dir/polkit/49-fortivpn-sgcan.rules.in" >"$rules_tmp"
+    install -o root -g root -m 644 "$rules_tmp" /etc/polkit-1/rules.d/49-fortivpn-sgcan.rules
+    rm -f "$rules_tmp"
 fi
+
+# Status without privileges: the user's group may query charon over VICI.
+install -d -o root -g root -m 755 /etc/systemd/system/strongswan.service.d
+vici_tmp=$(mktemp)
+sed "s/@VPN_GROUP@/$target_group/g" "$repo_dir/systemd/strongswan-vici-group.conf.in" >"$vici_tmp"
+install -o root -g root -m 644 "$vici_tmp" /etc/systemd/system/strongswan.service.d/fortivpn-vici.conf
+rm -f "$vici_tmp"
 
 tmpfiles_tmp=$(mktemp)
 trap 'rm -f "$tmpfiles_tmp"' EXIT

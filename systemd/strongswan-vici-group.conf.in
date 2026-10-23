@@ -1,0 +1,5 @@
+# Installed as /etc/systemd/system/strongswan.service.d/fortivpn-vici.conf.
+# Lets the desktop user's group read the VPN status with `swanctl --list-sas`
+# without privileges. charon recreates the socket as root:root 0770 on start.
+[Service]
+ExecStartPost=/bin/sh -c 'for i in $(seq 1 50); do [ -S /run/charon.vici ] && break; sleep 0.1; done; chgrp @VPN_GROUP@ /run/charon.vici && chmod 0770 /run/charon.vici'
